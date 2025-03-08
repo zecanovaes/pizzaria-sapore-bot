@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const ngrok = require('ngrok');
 const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
@@ -213,6 +214,24 @@ async function initializeDB() {
     }
   } catch (error) {
     console.error('Erro ao inicializar o banco de dados:', error);
+  }
+}
+
+async function setupNgrok(port) {
+  try {
+    // Conectar ao ngrok e criar um túnel para a porta especificada
+    const url = await ngrok.connect({
+      addr: port,
+      region: 'us', // Você pode mudar para 'eu', 'ap', 'au', 'sa', 'jp', 'in'
+    });
+    
+    console.log(`✅ Túnel ngrok criado: ${url}`);
+    console.log(`🔍 Acesse o QR code em: ${url}/qrcode`);
+    
+    return url;
+  } catch (error) {
+    console.error('❌ Erro ao iniciar ngrok:', error);
+    return null;
   }
 }
 
@@ -3140,17 +3159,61 @@ app.post('/api/categorias', async (req, res) => {
 });
 
 app.get('/qrcode', (req, res) => {
-  if (global.qrcode) {
+  if (global.qrCodeImage) {
     res.send(`
       <html>
+        <head>
+          <title>WhatsApp QR Code</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <style>
+            body { font-family: Arial, sans-serif; text-align: center; margin-top: 50px; }
+            img { max-width: 100%; height: auto; margin: 20px auto; display: block; }
+            .container { max-width: 500px; margin: 0 auto; padding: 20px; }
+            .status { margin: 20px 0; padding: 10px; border-radius: 5px; }
+            .connected { background-color: #d4edda; color: #155724; }
+            .waiting { background-color: #fff3cd; color: #856404; }
+          </style>
+        </head>
         <body>
-          <h1>WhatsApp QR Code</h1>
-          <img src="${global.qrcode}"/>
+          <div class="container">
+            <h1>WhatsApp QR Code</h1>
+            ${global.whatsappConnected 
+              ? '<div class="status connected">✅ WhatsApp conectado!</div>' 
+              : '<div class="status waiting">⏳ Escaneie o código QR com o WhatsApp no seu celular</div>'}
+            <img src="${global.qrCodeImage}" alt="QR Code para WhatsApp Web"/>
+            <p>Escaneie este código com o seu aplicativo WhatsApp para conectar o bot.</p>
+            <button onclick="location.reload()">Atualizar</button>
+          </div>
         </body>
       </html>
     `);
   } else {
-    res.send('QR Code ainda não está disponível. Aguarde e recarregue.');
+    res.send(`
+      <html>
+        <head>
+          <title>WhatsApp QR Code</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <style>
+            body { font-family: Arial, sans-serif; text-align: center; margin-top: 50px; }
+            .container { max-width: 500px; margin: 0 auto; padding: 20px; }
+            .status { margin: 20px 0; padding: 10px; border-radius: 5px; }
+            .waiting { background-color: #fff3cd; color: #856404; }
+            .connected { background-color: #d4edda; color: #155724; }
+          </style>
+          <meta http-equiv="refresh" content="5">
+        </head>
+        <body>
+          <div class="container">
+            <h1>WhatsApp QR Code</h1>
+            ${global.whatsappConnected 
+              ? '<div class="status connected">✅ WhatsApp conectado!</div>' 
+              : '<div class="status waiting">⏳ Aguardando geração do QR code...</div>'}
+            <p>A página será atualizada automaticamente em 5 segundos.</p>
+            <button onclick="location.reload()">Atualizar agora</button>
+          </div>
+        </body>
+      </html>
+    `);
   }
 });
 
@@ -3310,12 +3373,15 @@ app.get('/api/conversas/:id', async (req, res) => {
 
 // ======== INICIALIZAÇÃO ==========
 
-// Eventos do WhatsApp Bot
-client.on('qr', (qr) => {
-  console.log('[INFO] QR Code gerado');
-  // Armazene o QR code como imagem base64
-  global.qrcode = require('qrcode').toDataURL(qr);
-  // Também gera no terminal para depuração
+client.on('qr', async (qr) => {
+  console.log('[INFO] QR Code gerado. Escaneie com seu WhatsApp:');
+  
+  // Armazenar o QR code como imagem base64 para exibição via web
+  const qrcode = require('qrcode');
+  global.qrCodeImage = await qrcode.toDataURL(qr);
+  global.whatsappConnected = false;
+  
+  // Exibir no console para debugging
   qrcode.generate(qr, { small: true });
 });
 
@@ -3325,6 +3391,7 @@ client.on('authenticated', () => {
 
 client.on('ready', () => {
   console.log('[BOT PRONTO] O bot está ativo e operando normalmente.');
+  global.whatsappConnected = true;
 
   // Ativar função de keepAlive caso esteja em produção
   if (isProduction) {
@@ -3384,6 +3451,108 @@ client.on('message', async (message) => {
 });
 
 // Inicialização do servidor e aplicativos
+// Adicione esta seção no início do arquivo, na parte de importações
+const ngrok = require('ngrok');
+
+// Adicione esta função para configurar o ngrok
+async function setupNgrok(port) {
+  try {
+    // Conectar ao ngrok e criar um túnel para a porta especificada
+    const url = await ngrok.connect({
+      addr: port,
+      region: 'us', // Você pode mudar para 'eu', 'ap', 'au', 'sa', 'jp', 'in'
+    });
+    
+    console.log(`✅ Túnel ngrok criado: ${url}`);
+    console.log(`🔍 Acesse o QR code em: ${url}/qrcode`);
+    
+    return url;
+  } catch (error) {
+    console.error('❌ Erro ao iniciar ngrok:', error);
+    return null;
+  }
+}
+
+// Adicione esta rota para exibir o QR code
+app.get('/qrcode', (req, res) => {
+  if (global.qrCodeImage) {
+    res.send(`
+      <html>
+        <head>
+          <title>WhatsApp QR Code</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <style>
+            body { font-family: Arial, sans-serif; text-align: center; margin-top: 50px; }
+            img { max-width: 100%; height: auto; margin: 20px auto; display: block; }
+            .container { max-width: 500px; margin: 0 auto; padding: 20px; }
+            .status { margin: 20px 0; padding: 10px; border-radius: 5px; }
+            .connected { background-color: #d4edda; color: #155724; }
+            .waiting { background-color: #fff3cd; color: #856404; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <h1>WhatsApp QR Code</h1>
+            ${global.whatsappConnected 
+              ? '<div class="status connected">✅ WhatsApp conectado!</div>' 
+              : '<div class="status waiting">⏳ Escaneie o código QR com o WhatsApp no seu celular</div>'}
+            <img src="${global.qrCodeImage}" alt="QR Code para WhatsApp Web"/>
+            <p>Escaneie este código com o seu aplicativo WhatsApp para conectar o bot.</p>
+            <button onclick="location.reload()">Atualizar</button>
+          </div>
+        </body>
+      </html>
+    `);
+  } else {
+    res.send(`
+      <html>
+        <head>
+          <title>WhatsApp QR Code</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <style>
+            body { font-family: Arial, sans-serif; text-align: center; margin-top: 50px; }
+            .container { max-width: 500px; margin: 0 auto; padding: 20px; }
+            .status { margin: 20px 0; padding: 10px; border-radius: 5px; }
+            .waiting { background-color: #fff3cd; color: #856404; }
+            .connected { background-color: #d4edda; color: #155724; }
+          </style>
+          <meta http-equiv="refresh" content="5">
+        </head>
+        <body>
+          <div class="container">
+            <h1>WhatsApp QR Code</h1>
+            ${global.whatsappConnected 
+              ? '<div class="status connected">✅ WhatsApp conectado!</div>' 
+              : '<div class="status waiting">⏳ Aguardando geração do QR code...</div>'}
+            <p>A página será atualizada automaticamente em 5 segundos.</p>
+            <button onclick="location.reload()">Atualizar agora</button>
+          </div>
+        </body>
+      </html>
+    `);
+  }
+});
+
+// Modifique o evento 'qr' do cliente WhatsApp
+client.on('qr', async (qr) => {
+  console.log('[INFO] QR Code gerado. Escaneie com seu WhatsApp:');
+  
+  // Armazenar o QR code como imagem base64 para exibição via web
+  const qrcode = require('qrcode');
+  global.qrCodeImage = await qrcode.toDataURL(qr);
+  global.whatsappConnected = false;
+  
+  // Exibir no console para debugging
+  qrcode.generate(qr, { small: true });
+});
+
+// Adicione um evento para quando o WhatsApp conectar
+client.on('ready', () => {
+  console.log('[BOT PRONTO] WhatsApp conectado e operando normalmente.');
+  global.whatsappConnected = true;
+});
+
+// Modifique a função startServer() para incluir a configuração do ngrok
 async function startServer() {
   try {
     // Conectar ao MongoDB
@@ -3391,24 +3560,28 @@ async function startServer() {
       useNewUrlParser: true,
       useUnifiedTopology: true
     });
-    console.log('Conectado ao MongoDB');
-
+    console.log('✅ Conectado ao MongoDB');
+    
     // Inicializar banco de dados com dados padrão
     await initializeDB();
-
+    
     // Iniciar o servidor Express
-    app.listen(PORT, () => {
-      console.log(`Servidor Express rodando na porta ${PORT}`);
-
-      // Inicializar o cliente WhatsApp após o servidor estar rodando
-      client.initialize().then(() => {
-        console.log('Cliente WhatsApp inicializado');
-      }).catch(err => {
-        console.error('Erro ao inicializar cliente WhatsApp:', err);
+    const server = app.listen(PORT, () => {
+      console.log(`✅ Servidor Express rodando na porta ${PORT}`);
+      
+      // Iniciar ngrok após o servidor estar rodando
+      setupNgrok(PORT).then(ngrokUrl => {
+        // Inicializar o cliente WhatsApp
+        console.log('🔄 Inicializando cliente WhatsApp...');
+        client.initialize().then(() => {
+          console.log('✅ Cliente WhatsApp inicializado');
+        }).catch(err => {
+          console.error('❌ Erro ao inicializar cliente WhatsApp:', err);
+        });
       });
     });
   } catch (error) {
-    console.error('Erro ao iniciar o servidor:', error);
+    console.error('❌ Erro ao iniciar o servidor:', error);
     process.exit(1);
   }
 }
