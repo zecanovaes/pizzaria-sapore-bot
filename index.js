@@ -3545,6 +3545,9 @@ client.on('ready', () => {
   global.whatsappConnected = true;
 });
 
+let isClientReady = false;
+let latestQR = null;
+
 // Modifique a função startServer() para incluir a configuração do ngrok
 function startServer() {
   if (!isClientReady) {
