@@ -3139,6 +3139,21 @@ app.post('/api/categorias', async (req, res) => {
   }
 });
 
+app.get('/qrcode', (req, res) => {
+  if (global.qrcode) {
+    res.send(`
+      <html>
+        <body>
+          <h1>WhatsApp QR Code</h1>
+          <img src="${global.qrcode}"/>
+        </body>
+      </html>
+    `);
+  } else {
+    res.send('QR Code ainda não está disponível. Aguarde e recarregue.');
+  }
+});
+
 // Configuração do Bot
 app.get('/api/bot-config', async (req, res) => {
   try {
@@ -3297,7 +3312,10 @@ app.get('/api/conversas/:id', async (req, res) => {
 
 // Eventos do WhatsApp Bot
 client.on('qr', (qr) => {
-  console.log('[INFO] QR Code gerado. Escaneie com seu WhatsApp:');
+  console.log('[INFO] QR Code gerado');
+  // Armazene o QR code como imagem base64
+  global.qrcode = require('qrcode').toDataURL(qr);
+  // Também gera no terminal para depuração
   qrcode.generate(qr, { small: true });
 });
 
