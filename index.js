@@ -119,7 +119,7 @@ const puppeteerOptions = {
     '--allow-running-insecure-content',
     '--disable-extensions'
   ],
-  headless: true,
+  headless: false,
   executablePath: '/usr/bin/google-chrome-stable'
 };
 
