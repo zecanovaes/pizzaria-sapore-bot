@@ -174,7 +174,7 @@ async function initialize() {
 // Iniciar a aplicação
 initialize();
 
-async function setupNgrok(port) {
+async function setupNgrok(port) { 
   try {
     // Conectar ao ngrok e criar um túnel para a porta especificada
     const url = await ngrok.connect({
