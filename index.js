@@ -3454,18 +3454,48 @@ client.on('message', async (message) => {
 // Adicione esta função para configurar o ngrok
 async function setupNgrok(port) {
   try {
-    // Conectar ao ngrok e criar um túnel para a porta especificada
-    const url = await ngrok.connect({
-      addr: port,
-      region: 'us', // Você pode mudar para 'eu', 'ap', 'au', 'sa', 'jp', 'in'
+    // Caminho para o binário do ngrok (ajuste conforme sua instalação)
+    const ngrokPath = './ngrok';
+    const { exec } = require('child_process');
+    
+    // Iniciar ngrok como um processo separado
+    console.log('🚀 Iniciando ngrok...');
+    const ngrokProcess = exec(`${ngrokPath} http ${port}`, (error, stdout, stderr) => {
+      if (error) {
+        console.error(`Erro na execução do ngrok: ${error}`);
+        return;
+      }
+      console.log(`Saída do ngrok: ${stdout}`);
+      if (stderr) console.error(`Erros do ngrok: ${stderr}`);
     });
     
-    console.log(`✅ Túnel ngrok criado: ${url}`);
-    console.log(`🔍 Acesse o QR code em: ${url}/qrcode`);
+    // Aguardar um momento para o ngrok iniciar e abrir API
+    await new Promise(resolve => setTimeout(resolve, 3000));
     
-    return url;
+    // Consultar URL do túnel via API do ngrok
+    try {
+      const response = await axios.get('http://127.0.0.1:4040/api/tunnels');
+      const tunnel = response.data.tunnels[0];
+      if (tunnel && tunnel.public_url) {
+        const url = tunnel.public_url;
+        console.log(`✅ Túnel ngrok criado: ${url}`);
+        console.log(`🔍 Acesse o QR code em: ${url}/qrcode`);
+        return url;
+      } else {
+        console.error('❌ Nenhum túnel encontrado na resposta do ngrok');
+        return null;
+      }
+    } catch (apiError) {
+      console.error('❌ Erro ao consultar API do ngrok:', apiError.message);
+      console.log('🔄 Tentando alternativa: Executando ngrok em modo não-detached');
+      
+      // Modo alternativo: usar a porta padrão
+      console.log(`⚠️ Usando fallback: Acesse o QR code em: http://localhost:${port}/qrcode`);
+      console.log('⚠️ Para acesso externo, você precisará expor essa porta manualmente');
+      return `http://localhost:${port}`;
+    }
   } catch (error) {
-    console.error('❌ Erro ao iniciar ngrok:', error);
+    console.error('❌ Erro geral ao iniciar ngrok:', error);
     return null;
   }
 }
