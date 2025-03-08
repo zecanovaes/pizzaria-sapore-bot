@@ -7,6 +7,7 @@ const { OpenAI } = require('openai');
 const dotenv = require('dotenv');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
+const { exec } = require('child_process'); // Para evitar desligamento em VM
 
 // Configurar ffmpeg
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -14,72 +15,98 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 // Carregar variáveis de ambiente
 dotenv.config();
 
-// Configurações
-const API_URL = process.env.API_URL || 'http://localhost:3001/api';
-const MEDIA_PATH = './media';
+// Ajustar caminhos para ambiente Oracle Cloud
+const MEDIA_PATH = process.env.ORACLE_CLOUD 
+  ? path.join(__dirname, 'media') 
+  : './media';
 
-// Inicializar OpenAI para transcrição
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
+const AUTH_PATH = process.env.ORACLE_CLOUD 
+  ? path.join(__dirname, '.wwebjs_auth')
+  : './.wwebjs_auth';
 
-// Criar pasta de mídia se não existir
+// Criar diretórios se não existirem
 if (!fs.existsSync(MEDIA_PATH)) {
   fs.mkdirSync(MEDIA_PATH, { recursive: true });
 }
+if (!fs.existsSync(AUTH_PATH)) {
+  fs.mkdirSync(AUTH_PATH, { recursive: true });
+}
 
-// Inicializar cliente WhatsApp
+// Verificar se está rodando em produção
+const isProduction = process.env.NODE_ENV === 'production' || process.env.ORACLE_CLOUD === 'true';
+
+// Configurações otimizadas do Puppeteer para Oracle Cloud
+const puppeteerOptions = {
+  args: [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-gpu',
+    '--disable-dev-shm-usage', // Evita problemas com memória compartilhada
+    '--disable-accelerated-2d-canvas',
+    '--no-first-run',
+    '--no-zygote',
+    '--single-process', // Reduz uso de memória
+    '--disable-infobars',
+    '--window-size=1366,768'
+  ],
+  headless: true,
+  executablePath: process.env.ORACLE_CLOUD 
+    ? '/usr/bin/google-chrome-stable' // Caminho correto do Chrome na Oracle Cloud
+    : undefined
+};
+
+// Inicializar cliente WhatsApp com novas configurações
 const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }),
-  puppeteer: {
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu'],
-    headless: true
+  authStrategy: new LocalAuth({ dataPath: AUTH_PATH }),
+  puppeteer: puppeteerOptions,
+  webVersionCache: {
+    type: 'remote', // Melhor para ambiente de servidor
+    remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2332.15.html'
   }
+});
+
+// Função para manter o bot rodando e evitar desligamento em VMs
+function keepAlive() {
+  setInterval(() => {
+    console.log(`[BOT ATIVO] ${new Date().toISOString()}`);
+    
+    // Rodar um comando "heartbeat" para evitar que a sessão SSH seja encerrada
+    exec('echo "Bot ativo"', (err, stdout, stderr) => {
+      if (err) {
+        console.error("Erro no keepAlive:", stderr);
+      }
+    });
+  }, 30 * 60 * 1000); // Log a cada 30 minutos
+}
+
+// Tentativa de reconexão automática
+client.on('disconnected', (reason) => {
+  console.log('[ERRO] Cliente desconectado:', reason);
+
+  setTimeout(() => {
+    console.log('[INFO] Tentando reconectar...');
+    client.initialize();
+  }, 10000); // Tentar reconectar após 10 segundos
 });
 
 // Evento quando o QR code é gerado
 client.on('qr', (qr) => {
-  console.log('QR Code gerado. Escaneie com seu WhatsApp:');
+  console.log('[INFO] QR Code gerado. Escaneie com seu WhatsApp:');
   qrcode.generate(qr, { small: true });
 });
 
 client.on('authenticated', () => {
-  console.log('Autenticado com sucesso no WhatsApp!');
+  console.log('[SUCESSO] Autenticado com sucesso no WhatsApp!');
 });
 
 client.on('ready', () => {
-  console.log('Bot pronto para atender!');
+  console.log('[BOT PRONTO] O bot está ativo e operando normalmente.');
+
+  // Ativar função de keepAlive caso esteja em produção
+  if (isProduction) {
+    keepAlive();
+  }
 });
-
-// Função para converter áudio para formato compatível com a API OpenAI
-async function convertAudio(inputPath, outputPath) {
-  return new Promise((resolve, reject) => {
-    console.log(`Convertendo áudio de ${inputPath} para ${outputPath}`);
-
-    ffmpeg(inputPath)
-      .output(outputPath)
-      .audioCodec('libmp3lame')
-      .audioBitrate('128k')
-      .audioChannels(1)
-      .audioFrequency(16000) // Whisper funciona melhor com 16kHz
-      .toFormat('mp3')
-      .on('start', (commandLine) => {
-        console.log('FFmpeg iniciado com comando:', commandLine);
-      })
-      .on('progress', (progress) => {
-        console.log(`Progresso da conversão: ${progress.percent}%`);
-      })
-      .on('end', () => {
-        console.log('Conversão de áudio concluída com sucesso');
-        resolve();
-      })
-      .on('error', (err) => {
-        console.error('Erro na conversão de áudio:', err);
-        reject(err);
-      })
-      .run();
-  });
-}
 
 // Registrar primeiras interações para buscar mensagem de boas-vindas
 const userInteractions = new Map();
