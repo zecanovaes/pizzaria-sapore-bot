@@ -3160,6 +3160,10 @@ app.post('/api/categorias', async (req, res) => {
   }
 });
 
+global.qrCodeImage = null;
+global.whatsappConnected = false;
+
+// Rota para visualizar o QR code
 app.get('/qrcode', (req, res) => {
   if (global.qrCodeImage) {
     res.send(`
