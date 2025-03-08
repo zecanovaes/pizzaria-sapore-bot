@@ -151,73 +151,31 @@ const dataCache = {
 // ======== FUNÇÕES COMPARTILHADAS ==========
 
 // Inicializar banco de dados com dados padrão, se necessário
-async function initializeDB() {
+async function initialize() {
   try {
-    // Verificar se já existe configuração do bot
-    const botConfigCount = await BotConfig.countDocuments();
-    if (botConfigCount === 0) {
-      await BotConfig.create({
-        nome: "",
-        descricao: "",
-        personalidade: "",
-        procedimento: "",
-        regras: "",
-        welcomeMessage: "",
-        unsupportedMediaMessage: "",
-        menuImage: "",
-        menuImageCaption: "",
-        confirmationImage: "",
-        confirmationImageCaption: "",
-        systemPrompt: "",
-        formatInstruction: "[TEXT_FORMAT], [VOICE_FORMAT], [IMAGE_FORMAT] ou [JSON_FORMAT] seguido de [/END]",
-      });
-      console.log('Configuração inicial do bot criada');
-    }
-
-    // Verificar se já existe história da pizzaria
-    const historiaCount = await PizzariaHistoria.countDocuments();
-    if (historiaCount === 0) {
-      await PizzariaHistoria.create({
-        titulo: "",
-        conteudo: "",
-        imagem: ""
-      });
-      console.log('História da pizzaria inicializada');
-    }
-
-    // Verificar configuração de entrega
-    const deliveryConfigCount = await DeliveryConfig.countDocuments();
-    if (deliveryConfigCount === 0) {
-      await DeliveryConfig.create({
-        enabled: true,
-        areas: [
-          { city: "São Paulo", state: "SP", active: true }
-        ],
-        restrictions: {
-          limitToSpecificAreas: false,
-          maxDistance: 0,
-          additionalFeePerKm: 0
-        },
-        messages: {
-          outsideAreaMessage: "Desculpe, não entregamos nesse endereço no momento.",
-          partialAddressMessage: "Por favor, forneça o endereço completo com número e bairro."
-        }
-      });
-      console.log('Configuração de entrega inicializada');
-    }
-
-    // Verificar chaves de API
-    const apiKeysCount = await ApiKeys.countDocuments();
-    if (apiKeysCount === 0) {
-      await ApiKeys.create({
-        googleMaps: ""
-      });
-      console.log('Chaves de API inicializadas');
-    }
+    // Conectar ao MongoDB
+    await mongoose.connect(process.env.MONGODB_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true
+    });
+    console.log('✅ Conectado ao MongoDB');
+    
+    // Inicializar banco de dados com dados padrão
+    await initializeDB();
+    
+    // Inicializar o cliente WhatsApp
+    console.log('🔄 Inicializando cliente WhatsApp...');
+    client.initialize();
+    
+    // A função startServer será chamada quando o cliente estiver pronto
   } catch (error) {
-    console.error('Erro ao inicializar o banco de dados:', error);
+    console.error('❌ Erro ao inicializar aplicação:', error);
+    process.exit(1);
   }
 }
+
+// Iniciar a aplicação
+initialize();
 
 async function setupNgrok(port) {
   try {
@@ -3379,13 +3337,15 @@ app.get('/api/conversas/:id', async (req, res) => {
 
 // ======== INICIALIZAÇÃO ==========
 
-client.on('qr', async (qr) => {
+client.on('qr', (qr) => {
   console.log('[INFO] QR Code gerado. Escaneie com seu WhatsApp:');
   
-  // Armazenar o QR code como imagem base64 para exibição via web
-  const qrcode = require('qrcode');
-  global.qrCodeImage = await qrcode.toDataURL(qr);
-  global.whatsappConnected = false;
+  // Armazenar o QR code mais recente
+  latestQR = qr;
+  
+  // Gerar o link para o QR code
+  const qrLink = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qr)}`;
+  console.log(`\n📱 Link para QR code: ${qrLink}\n`);
   
   // Exibir no console para debugging
   qrcode.generate(qr, { small: true });
@@ -3396,14 +3356,14 @@ client.on('authenticated', () => {
 });
 
 client.on('ready', () => {
-  console.log('[BOT PRONTO] O bot está ativo e operando normalmente.');
-  global.whatsappConnected = true;
-
-  // Ativar função de keepAlive caso esteja em produção
-  if (isProduction) {
-    keepAlive();
-  }
+  console.log('[BOT PRONTO] WhatsApp conectado e operando normalmente!');
+  isClientReady = true;
+  latestQR = null; // Limpar o QR code
+  
+  // Iniciar o servidor agora que estamos conectados
+  startServer();
 });
+
 
 // Tentativa de reconexão automática do WhatsApp
 client.on('disconnected', (reason) => {
@@ -3586,37 +3546,26 @@ client.on('ready', () => {
 });
 
 // Modifique a função startServer() para incluir a configuração do ngrok
-async function startServer() {
-  try {
-    // Conectar ao MongoDB
-    await mongoose.connect(process.env.MONGODB_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true
-    });
-    console.log('✅ Conectado ao MongoDB');
+function startServer() {
+  if (!isClientReady) {
+    console.log("⏳ Aguardando o WhatsApp conectar antes de iniciar o servidor...");
     
-    // Inicializar banco de dados com dados padrão
-    await initializeDB();
+    // Se tivermos um QR code disponível, exibimos o link
+    if (latestQR) {
+      const qrLink = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(latestQR)}`;
+      console.log(`\n🔍 Escaneie o QR code com seu WhatsApp:`);
+      console.log(`📱 ${qrLink}\n`);
+    }
     
-    // Iniciar o servidor Express
-    const server = app.listen(PORT, () => {
-      console.log(`✅ Servidor Express rodando na porta ${PORT}`);
-      
-      // Iniciar ngrok após o servidor estar rodando
-      setupNgrok(PORT).then(ngrokUrl => {
-        // Inicializar o cliente WhatsApp
-        console.log('🔄 Inicializando cliente WhatsApp...');
-        client.initialize().then(() => {
-          console.log('✅ Cliente WhatsApp inicializado');
-        }).catch(err => {
-          console.error('❌ Erro ao inicializar cliente WhatsApp:', err);
-        });
-      });
-    });
-  } catch (error) {
-    console.error('❌ Erro ao iniciar o servidor:', error);
-    process.exit(1);
+    // Verificar novamente após um tempo
+    setTimeout(startServer, 3000);
+    return;
   }
+  
+  // Se chegou aqui, o cliente está pronto, podemos iniciar o servidor
+  app.listen(PORT, () => {
+    console.log(`🚀 Servidor rodando na porta ${PORT}`);
+  });
 }
 
 // Iniciar o servidor
