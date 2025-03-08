@@ -112,13 +112,15 @@ const puppeteerOptions = {
     '--no-first-run',
     '--no-zygote',
     '--single-process',
+    '--disable-web-security',
     '--disable-infobars',
-    '--window-size=1366,768'
+    '--window-size=1366,768',
+    '--ignore-certificate-errors',
+    '--allow-running-insecure-content',
+    '--disable-extensions'
   ],
   headless: true,
-  executablePath: process.env.ORACLE_CLOUD
-    ? '/usr/bin/google-chrome-stable'
-    : undefined
+  executablePath: '/usr/bin/google-chrome-stable'
 };
 
 // Inicializar cliente WhatsApp
