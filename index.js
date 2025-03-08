@@ -9,7 +9,39 @@ const axios = require('axios');
 const mongoose = require('mongoose');
 const { OpenAI } = require('openai');
 const cloudinary = require('cloudinary').v2;
+const qrcode = require('qrcode-terminal');
+const { Client, LocalAuth, MessageMedia, Buttons } = require('whatsapp-web.js');
+const ffmpeg = require('fluent-ffmpeg');
+const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
+const { exec } = require('child_process');
 
+// Configurar ffmpeg
+ffmpeg.setFfmpegPath(ffmpegPath);
+
+// Carregar variáveis de ambiente
+dotenv.config();
+
+// Definir caminhos para mídia e autenticação
+const MEDIA_PATH = process.env.ORACLE_CLOUD
+  ? path.join(__dirname, 'media')
+  : './media';
+
+const AUTH_PATH = process.env.ORACLE_CLOUD
+  ? path.join(__dirname, '.wwebjs_auth')
+  : './.wwebjs_auth';
+
+// Criar diretórios necessários
+if (!fs.existsSync(MEDIA_PATH)) {
+  fs.mkdirSync(MEDIA_PATH, { recursive: true });
+}
+if (!fs.existsSync(AUTH_PATH)) {
+  fs.mkdirSync(AUTH_PATH, { recursive: true });
+}
+
+// Verificar ambiente de produção
+const isProduction = process.env.NODE_ENV === 'production' || process.env.ORACLE_CLOUD === 'true';
+
+// ======== CONFIGURAÇÃO MONGOOSE ==========
 mongoose.set('strictQuery', false);
 
 // Importar modelos
@@ -25,39 +57,24 @@ const {
   ApiKeys
 } = require('./models');
 
-// Carregar variáveis de ambiente
-dotenv.config();
-
+// ======== CONFIGURAÇÃO CLOUDINARY ==========
 cloudinary.config({
   cloud_name: 'dg4zmbjmt',
   api_key: process.env.CLOUDINARY_KEY,
   api_secret: process.env.CLOUDINARY_SECRET
 });
 
-// Inicializar Express
+// ======== CONFIGURAÇÃO EXPRESS ==========
 const app = express();
 const PORT = process.env.PORT || 3000;
 const API_URL = process.env.API_URL || 'http://localhost:3001';
 
-// Middleware
+// Middleware Express
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));  // Aumenta o limite para 10MB
-app.use(express.urlencoded({ limit: '10mb', extended: true }));  // Para uploads via formulário
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(bodyParser.json());
 app.use('/api/media', express.static(path.join(__dirname, 'public', 'media')));
-
-// Conexão com MongoDB
-mongoose.connect(process.env.MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true
-}).then(() => {
-  console.log('Conectado ao MongoDB');
-  // Inicializar dados padrão se necessário
-  initializeDB();
-}).catch(err => {
-  console.error('Erro ao conectar com MongoDB:', err);
-});
-
 
 // Configurar OpenAI
 const openai = new OpenAI({
@@ -82,6 +99,54 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage: storage });
 
+// ======== CONFIGURAÇÃO WHATSAPP BOT ==========
+// Configurações do Puppeteer para o WhatsApp
+const puppeteerOptions = {
+  args: [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-gpu',
+    '--disable-dev-shm-usage',
+    '--disable-accelerated-2d-canvas',
+    '--no-first-run',
+    '--no-zygote',
+    '--single-process',
+    '--disable-infobars',
+    '--window-size=1366,768'
+  ],
+  headless: true,
+  executablePath: process.env.ORACLE_CLOUD
+    ? '/usr/bin/google-chrome-stable'
+    : undefined
+};
+
+// Inicializar cliente WhatsApp
+const client = new Client({
+  authStrategy: new LocalAuth({ dataPath: AUTH_PATH }),
+  puppeteer: puppeteerOptions,
+  webVersionCache: {
+    type: 'remote',
+    remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2332.15.html'
+  }
+});
+
+// Registrar primeiras interações para buscar mensagem de boas-vindas
+const userInteractions = new Map();
+
+// Armazenamento temporário de dados de pedido
+const tempPedidoData = new Map();
+
+// Cache de dados comuns
+const dataCache = {
+  botConfig: null,
+  historia: null,
+  cardapioBasico: null,
+  formasPagamento: null,
+  lastUpdated: 0
+};
+
+// ======== FUNÇÕES COMPARTILHADAS ==========
+
 // Inicializar banco de dados com dados padrão, se necessário
 async function initializeDB() {
   try {
@@ -100,9 +165,7 @@ async function initializeDB() {
         menuImageCaption: "",
         confirmationImage: "",
         confirmationImageCaption: "",
-        // Novo campo para armazenar o prompt do sistema
         systemPrompt: "",
-        // Novo campo para armazenar a instrução de formato
         formatInstruction: "[TEXT_FORMAT], [VOICE_FORMAT], [IMAGE_FORMAT] ou [JSON_FORMAT] seguido de [/END]",
       });
       console.log('Configuração inicial do bot criada');
@@ -153,12 +216,136 @@ async function initializeDB() {
   }
 }
 
-// === VALIDAÇÃO DE ENDEREÇOS ===
+// Função para manter o bot rodando e evitar desligamento em VMs
+function keepAlive() {
+  setInterval(() => {
+    console.log(`[BOT ATIVO] ${new Date().toISOString()}`);
 
+    // Rodar um comando "heartbeat" para evitar que a sessão SSH seja encerrada
+    exec('echo "Bot ativo"', (err, stdout, stderr) => {
+      if (err) {
+        console.error("Erro no keepAlive:", stderr);
+      }
+    });
+  }, 30 * 60 * 1000); // Log a cada 30 minutos
+}
+
+// Download de mídia
+async function downloadMedia(url, type) {
+  try {
+    console.log(`Iniciando download de ${type} de: ${url}`);
+
+    // Verificar se a URL é relativa (começa com /)
+    const fullUrl = url.startsWith('/')
+      ? `${API_URL.replace('/api', '')}${url}`
+      : url;
+
+    console.log(`URL completa para download: ${fullUrl}`);
+
+    // Baixar arquivo
+    const response = await axios({
+      method: 'get',
+      url: fullUrl,
+      responseType: 'arraybuffer',
+      timeout: 30000, // 30 segundos de timeout
+      headers: {
+        'Accept': '*/*' // Aceitar qualquer tipo de conteúdo
+      }
+    });
+
+    // Verificar a resposta
+    if (!response.data || response.data.length === 0) {
+      console.error('Download concluído, mas sem dados');
+      return null;
+    }
+
+    console.log(`Download concluído. Tamanho: ${response.data.length} bytes, Tipo: ${response.headers['content-type'] || 'não especificado'}`);
+
+    // Gerar nome de arquivo único
+    const extension = type === 'audio' ? 'mp3' : 'jpg';
+    const filename = `${MEDIA_PATH}/${type}_${Date.now()}.${extension}`;
+
+    // Garantir que o diretório existe
+    if (!fs.existsSync(MEDIA_PATH)) {
+      fs.mkdirSync(MEDIA_PATH, { recursive: true });
+    }
+
+    // Salvar arquivo
+    fs.writeFileSync(filename, response.data);
+    console.log(`Arquivo salvo em: ${filename}`);
+
+    // Verificar o arquivo salvo
+    const stats = fs.statSync(filename);
+    console.log(`Verificação do arquivo: ${filename}, tamanho: ${stats.size} bytes`);
+
+    if (stats.size === 0) {
+      console.error('Arquivo salvo está vazio');
+      return null;
+    }
+
+    return filename;
+  } catch (error) {
+    console.error(`Erro detalhado ao fazer download de ${type}:`, error);
+    if (error.response) {
+      console.error(`Status: ${error.response.status}, Dados: ${typeof error.response.data}`);
+    }
+    return null;
+  }
+}
+
+// Função para obter dados com cache
+async function getCachedData() {
+  const now = Date.now();
+
+  try {
+    console.log('[CACHE] Verificando dados em cache...');
+
+    // Se não temos nada em cache ou passou muito tempo, buscar tudo
+    if (!dataCache.botConfig || !dataCache.historia || !dataCache.formasPagamento ||
+      !dataCache.cardapioItems || now - dataCache.lastUpdated > 300000) {
+
+      console.log('[CACHE] Carregando dados essenciais...');
+
+      // Buscar apenas os campos necessários
+      dataCache.botConfig = await BotConfig.findOne().select('nome descricao personalidade systemPrompt welcomeMessage');
+      dataCache.historia = await PizzariaHistoria.findOne().select('titulo conteudo');
+      dataCache.formasPagamento = await FormaPagamento.find({ ativo: true }).select('nome requerTroco ativo');
+
+      // Carregar cardápio sem as imagens para economizar memória e tempo
+      console.log('[CACHE] Carregando cardápio sem imagens...');
+      dataCache.cardapioItems = await CardapioItem.find({ disponivel: true })
+        .select('nome descricao categoria preco identificador inspiracao');
+
+      dataCache.lastUpdated = now;
+      console.log('[CACHE] Dados carregados com sucesso');
+    } else {
+      console.log('[CACHE] Usando dados em cache (última atualização:', new Date(dataCache.lastUpdated).toISOString(), ')');
+    }
+
+    return {
+      botConfig: dataCache.botConfig,
+      historia: dataCache.historia,
+      formasPagamento: dataCache.formasPagamento,
+      cardapioItems: dataCache.cardapioItems
+    };
+  } catch (error) {
+    console.error('[CACHE] Erro ao carregar cache:', error);
+
+    // Em caso de erro, retornar objetos vazios para evitar exceções
+    return {
+      botConfig: null,
+      historia: null,
+      formasPagamento: [],
+      cardapioItems: []
+    };
+  }
+}
+
+// Validação e detecção de endereço 
 async function detectAndValidateCEP(message) {
-  const cepMatch = message.match(/(\d{5})-?\s*?(\d{3})/); // Captura CEPs em vários formatos
+  const cepMatch = message.match(/(\d{5})-?\s*?(\d{3})/);
   if (cepMatch) {
-    const cep = cepMatch[1] + cepMatch[2]; // Remove hífen ou espaço
+    const cep = cepMatch[1] + cepMatch[2];
     console.log(`CEP detectado: ${cep}`);
 
     try {
@@ -187,15 +374,10 @@ async function detectAndValidateCEP(message) {
       console.error("Erro ao consultar API do CEP:", error);
     }
   }
-  return null; // Retorna null se não encontrar CEP ou falhar na validação
+  return null;
 }
 
-/**
- * Valida e completa informações de endereço
- * @param {string} address - Endereço parcial informado pelo usuário
- * @param {boolean} isQuery - Se é apenas uma consulta sobre área de entrega
- * @returns {Promise<object>} - Objeto com endereço validado ou mensagem de erro
- */
+// Validação completa de endereço
 async function validateAddress(address, isQuery = false) {
   try {
     // Verificar se o endereço está vazio
@@ -214,7 +396,7 @@ async function validateAddress(address, isQuery = false) {
       console.log(`CEP encontrado: ${cep}, consultando API...`);
 
       try {
-        // Consultar API de CEP (exemplo usando BrasilAPI)
+        // Consultar API de CEP
         const response = await axios.get(`https://brasilapi.com.br/api/cep/v2/${cep}`);
 
         if (response.data) {
@@ -330,1140 +512,7 @@ async function validateAddress(address, isQuery = false) {
   }
 }
 
-/**
- * Determina o nível de precisão do endereço
- * @param {Array<string>} types - Tipos de endereço retornados pela API
- * @returns {string} - 'high', 'medium' ou 'low'
- */
-function getPrecisionLevel(types) {
-  if (types.includes('street_address') || types.includes('premise')) {
-    return 'high'; // Endereço completo com número
-  } else if (types.includes('route')) {
-    return 'medium'; // Rua sem número
-  } else {
-    return 'low'; // Apenas bairro, cidade ou genérico
-  }
-}
-
-/**
- * Verifica se o endereço está dentro da área de entrega
- * @param {object} components - Componentes do endereço
- * @returns {Promise<boolean>} - true se estiver na área de entrega
- */
-async function checkDeliveryArea(components) {
-  // Buscar configuração de entrega
-  const deliveryConfig = await DeliveryConfig.findOne();
-
-  // Se a validação estiver desabilitada ou não houver configuração
-  if (!deliveryConfig || !deliveryConfig.enabled) {
-    return true;
-  }
-
-  // Se não estiver limitado a áreas específicas
-  if (!deliveryConfig.restrictions.limitToSpecificAreas) {
-    return true;
-  }
-
-  // VERIFICAÇÃO SIMPLES E DEFINITIVA:
-  // Se a cidade não é São Paulo, não entregamos
-  if (!components.localidade || components.localidade !== "São Paulo") {
-    console.log(`Endereço fora da área de entrega. Cidade: ${components.localidade || "não identificada"}`);
-    return false;
-  }
-
-  // Se o estado não é SP, não entregamos
-  if (!components.administrativeArea || components.administrativeArea !== "SP") {
-    console.log(`Endereço fora do estado. Estado: ${components.administrativeArea || "não identificado"}`);
-    return false;
-  }
-
-  // Se chegou até aqui, o endereço está em São Paulo - SP
-  return true;
-}
-
-const dataCache = {
-  botConfig: null,
-  historia: null,
-  cardapioBasico: null,
-  formasPagamento: null,
-  lastUpdated: 0
-};
-
-// Função para obter dados com cache
-async function getCachedData() {
-  const now = Date.now();
-
-  try {
-    console.log('[CACHE] Verificando dados em cache...');
-
-    // Se não temos nada em cache ou passou muito tempo, buscar tudo
-    if (!dataCache.botConfig || !dataCache.historia || !dataCache.formasPagamento ||
-      !dataCache.cardapioItems || now - dataCache.lastUpdated > 300000) {
-
-      console.log('[CACHE] Carregando dados essenciais...');
-
-      // Buscar apenas os campos necessários
-      dataCache.botConfig = await BotConfig.findOne().select('nome descricao personalidade systemPrompt welcomeMessage');
-      dataCache.historia = await PizzariaHistoria.findOne().select('titulo conteudo');
-      dataCache.formasPagamento = await FormaPagamento.find({ ativo: true }).select('nome requerTroco ativo');
-
-      // Carregar cardápio sem as imagens para economizar memória e tempo
-      console.log('[CACHE] Carregando cardápio sem imagens...');
-      dataCache.cardapioItems = await CardapioItem.find({ disponivel: true })
-        .select('nome descricao categoria preco identificador inspiracao');
-
-      dataCache.lastUpdated = now;
-      console.log('[CACHE] Dados carregados com sucesso');
-    } else {
-      console.log('[CACHE] Usando dados em cache (última atualização:', new Date(dataCache.lastUpdated).toISOString(), ')');
-    }
-
-    return {
-      botConfig: dataCache.botConfig,
-      historia: dataCache.historia,
-      formasPagamento: dataCache.formasPagamento,
-      cardapioItems: dataCache.cardapioItems
-    };
-  } catch (error) {
-    console.error('[CACHE] Erro ao carregar cache:', error);
-
-    // Em caso de erro, retornar objetos vazios para evitar exceções
-    return {
-      botConfig: null,
-      historia: null,
-      formasPagamento: [],
-      cardapioItems: []
-    };
-  }
-}
-
-// =================== ENDPOINTS DA API =====================
-
-// Endpoint de verificação de saúde
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', time: new Date().toISOString() });
-});
-
-app.post('/api/get-image-by-id', async (req, res) => {
-  try {
-    const { imageId } = req.body;
-
-    if (!imageId) {
-      return res.status(400).json({
-        success: false,
-        message: 'ID de imagem não fornecido'
-      });
-    }
-
-    console.log(`Processando solicitação de imagem por ID: ${imageId}`);
-
-    // Buscar a imagem no banco de dados
-    let item = await CardapioItem.findOne({
-      identificador: imageId,
-      disponivel: true
-    });
-
-    // Se não encontrou pelo identificador exato, tenta buscar pelo nome da pizza no ID
-    if (!item && imageId.includes('pizza-')) {
-      const pizzaName = imageId.split('_pizza-')[1] || imageId.split('-pizza-')[1];
-      if (pizzaName) {
-        item = await CardapioItem.findOne({
-          nome: { $regex: new RegExp(pizzaName, 'i') },
-          disponivel: true
-        });
-      }
-    }
-
-    // Se ainda não encontrou, tentar uma busca mais ampla
-    if (!item) {
-      item = await CardapioItem.findOne({
-        $or: [
-          { identificador: { $regex: new RegExp(imageId, 'i') } },
-          { nome: { $regex: new RegExp(imageId, 'i') } }
-        ],
-        disponivel: true
-      });
-    }
-
-    if (!item || !item.imagemGeral) {
-      return res.status(404).json({
-        success: false,
-        message: 'Imagem não encontrada'
-      });
-    }
-
-    // Retornar apenas os dados da imagem (sem processar)
-    res.json({
-      success: true,
-      imageUrl: item.imagemGeral,
-      caption: `*${item.nome}*: ${item.descricao || ''}`
-    });
-  } catch (error) {
-    console.error('Erro ao buscar imagem por ID:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Erro ao buscar imagem'
-    });
-  }
-});
-
-// === Configuração do Bot ===
-app.get('/api/bot-config', async (req, res) => {
-  console.log('Rota /api/bot-config foi chamada');
-  try {
-    const config = await BotConfig.findOne();
-    console.log('Configuração encontrada:', config);
-    res.json(config || {});
-  } catch (error) {
-    console.error('Erro ao buscar configuração do bot:', error);
-    res.status(500).json({ success: false, message: 'Erro ao buscar configuração' });
-  }
-});
-
-app.put('/api/bot-config', async (req, res) => {
-  try {
-    const config = await BotConfig.findOne();
-
-    if (config) {
-      // Atualizar configuração existente
-      const updatedConfig = await BotConfig.findOneAndUpdate({}, req.body, { new: true });
-      res.json(updatedConfig);
-    } else {
-      // Criar nova configuração se não existir
-      const newConfig = await BotConfig.create(req.body);
-      res.json(newConfig);
-    }
-  } catch (error) {
-    console.error('Erro ao atualizar configuração do bot:', error);
-    res.status(500).json({ success: false, message: 'Erro ao atualizar configuração' });
-  }
-});
-
-// Buscar configuração de interação
-app.get('/api/interaction-config', async (req, res) => {
-  try {
-    const botConfig = await BotConfig.findOne();
-    res.json(botConfig.interactionRules || {});
-  } catch (error) {
-    console.error('Erro ao buscar configuração de interação:', error);
-    res.status(500).json({ error: 'Erro ao buscar configuração' });
-  }
-});
-
-// Salvar configuração de interação
-app.post('/api/interaction-config', async (req, res) => {
-  try {
-    const botConfig = await BotConfig.findOne();
-    botConfig.interactionRules = req.body;
-    await botConfig.save();
-    res.json({ success: true, message: 'Configurações salvas' });
-  } catch (error) {
-    console.error('Erro ao salvar configuração de interação:', error);
-    res.status(500).json({ error: 'Erro ao salvar configuração' });
-  }
-});
-
-// === História da Pizzaria ===
-app.get('/api/historia', async (req, res) => {
-  try {
-    const historia = await PizzariaHistoria.findOne();
-    res.json(historia || {});
-  } catch (error) {
-    console.error('Erro ao buscar história da pizzaria:', error);
-    res.status(500).json({ success: false, message: 'Erro ao buscar história' });
-  }
-});
-
-app.post('/api/historia', async (req, res) => {
-  try {
-    const historia = await PizzariaHistoria.findOne();
-    if (historia) {
-      // Atualizar história existente
-      await PizzariaHistoria.updateOne({}, req.body);
-    } else {
-      // Criar nova história
-      await PizzariaHistoria.create(req.body);
-    }
-    res.json({ success: true, message: 'História salva com sucesso' });
-  } catch (error) {
-    console.error('Erro ao salvar história da pizzaria:', error);
-    res.status(500).json({ success: false, message: 'Erro ao salvar história' });
-  }
-});
-
-app.get('/api/categorias', async (req, res) => {
-  try {
-    const categorias = await Categoria.find({ ativo: true }).sort({ ordem: 1 });
-    res.json(categorias);
-  } catch (error) {
-    console.error('Erro ao buscar categorias:', error);
-    res.status(500).json({ success: false, message: 'Erro ao buscar categorias' });
-  }
-});
-
-// Add category
-app.post('/api/categorias', async (req, res) => {
-  try {
-    console.log('Requisição para criar categoria recebida:', req.body);
-    const { nome } = req.body;
-
-    if (!nome) {
-      console.log('ERRO: Nome da categoria não fornecido');
-      return res.status(400).json({ success: false, message: 'Nome da categoria é obrigatório' });
-    }
-
-    console.log('Verificando se categoria já existe:', nome);
-    // Check if category already exists
-    const existente = await Categoria.findOne({ nome });
-    if (existente) {
-      console.log('Categoria já existe:', existente);
-      return res.status(400).json({ success: false, message: 'Esta categoria já existe' });
-    }
-
-    console.log('Buscando ordem máxima para nova categoria');
-    // Get highest order for new category
-    const maxOrdem = await Categoria.findOne().sort({ ordem: -1 });
-    const ordem = maxOrdem ? maxOrdem.ordem + 1 : 1;
-    console.log('Ordem para nova categoria:', ordem);
-
-    console.log('Criando nova categoria com dados:', { nome, ordem });
-    const novaCategoria = await Categoria.create({
-      nome,
-      ordem,
-      ativo: true // Garantir que está ativo por padrão
-    });
-
-    console.log('Nova categoria criada:', novaCategoria);
-    res.json({ success: true, categoria: novaCategoria });
-  } catch (error) {
-    console.error('Erro detalhado ao adicionar categoria:', error);
-    // Mostrar mais detalhes do erro
-    if (error.name === 'ValidationError') {
-      console.error('Erro de validação:', error.errors);
-    }
-    res.status(500).json({ success: false, message: 'Erro ao adicionar categoria' });
-  }
-});
-
-// Update category
-app.put('/api/categorias/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { nome, ordem, ativo } = req.body;
-
-    const categoria = await Categoria.findByIdAndUpdate(
-      id,
-      { nome, ordem, ativo },
-      { new: true }
-    );
-
-    if (!categoria) {
-      return res.status(404).json({ success: false, message: 'Categoria não encontrada' });
-    }
-
-    res.json({ success: true, categoria });
-  } catch (error) {
-    console.error('Erro ao atualizar categoria:', error);
-    res.status(500).json({ success: false, message: 'Erro ao atualizar categoria' });
-  }
-});
-
-// Delete category
-app.delete('/api/categorias/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    // Check if category is in use
-    const itemComCategoria = await CardapioItem.findOne({ categoria: id });
-    if (itemComCategoria) {
-      return res.status(400).json({
-        success: false,
-        message: 'Esta categoria não pode ser removida pois está em uso'
-      });
-    }
-
-    const resultado = await Categoria.findByIdAndDelete(id);
-    if (!resultado) {
-      return res.status(404).json({ success: false, message: 'Categoria não encontrada' });
-    }
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Erro ao remover categoria:', error);
-    res.status(500).json({ success: false, message: 'Erro ao remover categoria' });
-  }
-});
-
-app.get('/api/cardapio', async (req, res) => {
-  try {
-    // Buscar categorias e itens
-    const categorias = await Categoria.find();
-    const items = await CardapioItem.find();
-
-    console.log('Categorias encontradas:', categorias.length);
-    console.log('Itens encontrados:', items.length);
-
-    // Preparar mapeamento de IDs para nomes
-    const idParaNome = {};
-    categorias.forEach(cat => {
-      idParaNome[cat._id.toString()] = cat.nome;
-    });
-
-    // Processar itens para adicionar nome de categoria quando necessário
-    const itemsProcessados = items.map(item => {
-      const obj = item.toObject();
-
-      // Adicionar campo categoriaNome para facilitar filtragem no frontend
-      if (item.categoria) {
-        if (typeof item.categoria === 'string') {
-          if (mongoose.Types.ObjectId.isValid(item.categoria) &&
-            idParaNome[item.categoria]) {
-            // É um ID válido e encontramos o nome
-            obj.categoriaNome = idParaNome[item.categoria];
-          } else {
-            // Não é ID ou não encontramos no mapa, usar o valor como está
-            obj.categoriaNome = item.categoria;
-          }
-        } else if (item.categoria.toString && idParaNome[item.categoria.toString()]) {
-          // É um ObjectId e encontramos o nome
-          obj.categoriaNome = idParaNome[item.categoria.toString()];
-        }
-      }
-
-      return obj;
-    });
-
-    res.json({
-      categorias: categorias.map(c => c.nome),
-      items: itemsProcessados
-    });
-  } catch (error) {
-    console.error('Erro ao buscar cardápio:', error);
-    res.status(500).json({ success: false, message: 'Erro ao buscar cardápio' });
-  }
-});
-
-async function uploadToCloudinary(file, folder = 'pizzaria') {
-  try {
-    // Ler o arquivo do sistema
-    const imageBuffer = fs.readFileSync(file.path);
-
-    // Converter para Base64 (necessário para o upload via API)
-    const base64Image = `data:${file.mimetype};base64,${imageBuffer.toString('base64')}`;
-
-    // Fazer upload para o Cloudinary
-    const result = await cloudinary.uploader.upload(base64Image, {
-      folder: folder,
-      resource_type: 'image'
-    });
-
-    // Remover o arquivo temporário
-    fs.unlinkSync(file.path);
-
-    // Retornar a URL segura da imagem
-    return result.secure_url;
-  } catch (error) {
-    console.error('Erro ao fazer upload para Cloudinary:', error);
-    throw error;
-  }
-}
-
-// No endpoint POST /api/cardapio/item
-app.post('/api/cardapio/item', upload.fields([
-  { name: 'imagemGeral', maxCount: 1 },
-  { name: 'imagemEsquerda', maxCount: 1 },
-  { name: 'imagemDireita', maxCount: 1 }
-]), async (req, res) => {
-  try {
-    const { nome, descricao, inspiracao, categoria, preco, disponivel, identificador } = req.body;
-    const files = req.files;
-
-    // Verificar e processar categoria (código existente)
-    let categoriaValue = categoria;
-    if (mongoose.Types.ObjectId.isValid(categoria)) {
-      categoriaValue = categoria;
-    } else {
-      try {
-        const categoriaObj = await Categoria.findOne({ nome: categoria });
-        if (categoriaObj) {
-          categoriaValue = categoriaObj._id;
-          console.log(`Categoria encontrada: ${categoriaObj.nome} (${categoriaObj._id})`);
-        } else {
-          console.log(`Categoria não encontrada: ${categoria}, usando como string`);
-        }
-      } catch (err) {
-        console.error('Erro ao buscar categoria:', err);
-      }
-    }
-
-    // Upload de imagens para o Cloudinary
-    const imagemGeralUrl = files.imagemGeral ? await uploadToCloudinary(files.imagemGeral[0]) : null;
-    const imagemEsquerdaUrl = files.imagemEsquerda ? await uploadToCloudinary(files.imagemEsquerda[0]) : null;
-    const imagemDireitaUrl = files.imagemDireita ? await uploadToCloudinary(files.imagemDireita[0]) : null;
-
-    // Criar item no banco de dados com as URLs
-    const novoItem = await CardapioItem.create({
-      nome,
-      descricao,
-      inspiracao,
-      categoria: categoriaValue,
-      preco: parseFloat(preco),
-      disponivel: disponivel === 'true',
-      imagemGeral: imagemGeralUrl,
-      imagemEsquerda: imagemEsquerdaUrl,
-      imagemDireita: imagemDireitaUrl,
-      identificador
-    });
-
-    res.json(novoItem);
-  } catch (error) {
-    console.error('Erro ao adicionar item ao cardápio:', error);
-    res.status(500).json({ success: false, message: 'Erro ao adicionar item' });
-  }
-});
-
-app.put('/api/cardapio/item/:id', upload.fields([
-  { name: 'imagemGeral', maxCount: 1 },
-  { name: 'imagemEsquerda', maxCount: 1 },
-  { name: 'imagemDireita', maxCount: 1 }
-]), async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { nome, descricao, inspiracao, categoria, preco, disponivel, identificador } = req.body;
-    const files = req.files;
-
-    // Verificar e processar categoria (código existente)
-    let categoriaValue = categoria;
-    if (mongoose.Types.ObjectId.isValid(categoria)) {
-      categoriaValue = categoria;
-    } else {
-      try {
-        const categoriaObj = await Categoria.findOne({ nome: categoria });
-        if (categoriaObj) {
-          categoriaValue = categoriaObj._id;
-        } else {
-          console.log(`Categoria não encontrada: ${categoria}, usando como string`);
-        }
-      } catch (err) {
-        console.error('Erro ao buscar categoria:', err);
-      }
-    }
-
-    // Buscar item atual para verificar quais imagens já existem
-    const itemAtual = await CardapioItem.findById(id);
-    if (!itemAtual) {
-      return res.status(404).json({ success: false, message: 'Item não encontrado' });
-    }
-
-    // Dados para atualização
-    const updateData = {
-      nome,
-      descricao,
-      inspiracao,
-      categoria: categoriaValue,
-      preco: parseFloat(preco),
-      disponivel: disponivel === 'true',
-      identificador
-    };
-
-    // Processar cada imagem apenas se foi enviada
-    if (files.imagemGeral) {
-      updateData.imagemGeral = await uploadToCloudinary(files.imagemGeral[0]);
-    }
-    if (files.imagemEsquerda) {
-      updateData.imagemEsquerda = await uploadToCloudinary(files.imagemEsquerda[0]);
-    }
-    if (files.imagemDireita) {
-      updateData.imagemDireita = await uploadToCloudinary(files.imagemDireita[0]);
-    }
-
-    // Atualizar o item no banco de dados
-    const itemAtualizado = await CardapioItem.findByIdAndUpdate(id, updateData, { new: true });
-    res.json(itemAtualizado);
-  } catch (error) {
-    console.error('Erro ao atualizar item do cardápio:', error);
-    res.status(500).json({ success: false, message: 'Erro ao atualizar item' });
-  }
-});
-
-app.post('/api/upload-image', upload.single('image'), async (req, res) => {
-  try {
-    // Verificar se um arquivo foi enviado
-    if (!req.file) {
-      return res.status(400).json({
-        success: false,
-        message: 'Nenhuma imagem enviada'
-      });
-    }
-
-    // Upload para Cloudinary
-    const imageUrl = await uploadToCloudinary(req.file);
-
-    // Retornar a URL da imagem
-    res.json({
-      success: true,
-      url: imageUrl,
-      nome: req.body.imagemNome || 'imagem.jpg'
-    });
-  } catch (error) {
-    console.error('Erro ao processar upload de imagem:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Erro ao processar imagem'
-    });
-  }
-});
-
-app.delete('/api/cardapio/item/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    await CardapioItem.findByIdAndDelete(id);
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Erro ao remover item do cardápio:', error);
-    res.status(500).json({ success: false, message: 'Erro ao remover item' });
-  }
-});
-
-app.patch('/api/cardapio/item/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    // Verificar se o ID é válido
-    if (!id || !mongoose.Types.ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: 'ID inválido' });
-    }
-
-    console.log(`Tentando atualizar item com ID: ${id}`);
-    console.log('Dados recebidos para atualização:', req.body);
-
-    const item = await CardapioItem.findByIdAndUpdate(id, req.body, { new: true });
-
-    if (!item) {
-      console.log(`Item com ID ${id} não encontrado`);
-      return res.status(404).json({ success: false, message: 'Item não encontrado' });
-    }
-
-    console.log('Item atualizado com sucesso:', item);
-    res.json(item);
-  } catch (error) {
-    console.error('Erro ao atualizar item do cardápio:', error);
-    res.status(500).json({ success: false, message: 'Erro ao atualizar item' });
-  }
-});
-
-// === Formas de Pagamento ===
-app.get('/api/pagamentos', async (req, res) => {
-  try {
-    const formasPagamento = await FormaPagamento.find();
-    res.json(formasPagamento);
-  } catch (error) {
-    console.error('Erro ao buscar formas de pagamento:', error);
-    res.status(500).json({ success: false, message: 'Erro ao buscar formas de pagamento' });
-  }
-});
-
-app.post('/api/pagamentos', async (req, res) => {
-  try {
-    const { nome, requerTroco, ativo } = req.body;
-
-    // Criar nova forma de pagamento
-    const novaForma = await FormaPagamento.create({
-      nome,
-      requerTroco,
-      ativo
-    });
-
-    res.json(novaForma);
-  } catch (error) {
-    console.error('Erro ao adicionar forma de pagamento:', error);
-    res.status(500).json({ success: false, message: 'Erro ao adicionar forma de pagamento' });
-  }
-});
-
-app.delete('/api/pagamentos/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    await FormaPagamento.findByIdAndDelete(id);
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Erro ao remover forma de pagamento:', error);
-    res.status(500).json({ success: false, message: 'Erro ao remover forma de pagamento' });
-  }
-});
-
-app.patch('/api/pagamentos/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const forma = await FormaPagamento.findByIdAndUpdate(id, req.body, { new: true });
-
-    if (!forma) {
-      return res.status(404).json({ success: false, message: 'Forma de pagamento não encontrada' });
-    }
-
-    res.json(forma);
-  } catch (error) {
-    console.error('Erro ao atualizar forma de pagamento:', error);
-    res.status(500).json({ success: false, message: 'Erro ao atualizar forma de pagamento' });
-  }
-});
-
-// === Pedidos ===
-
-app.post('/api/pedidos', async (req, res) => {
-  try {
-    const { telefone, itens, valorTotal, endereco, formaPagamento, status } = req.body;
-
-    // Validar os dados recebidos
-    if (!telefone || !itens || !valorTotal || !endereco || !formaPagamento || !status) {
-      return res.status(400).json({ success: false, message: 'Dados do pedido incompletos' });
-    }
-
-    // Criar um novo pedido
-    const novoPedido = await Pedido.create({
-      telefone,
-      itens,
-      valorTotal,
-      endereco,
-      formaPagamento,
-      status,
-      data: new Date().toISOString()
-    });
-
-    res.json({ success: true, pedido: novoPedido });
-  } catch (error) {
-    console.error('Erro ao salvar pedido:', error);
-    res.status(500).json({ success: false, message: 'Erro ao salvar pedido' });
-  }
-});
-
-app.get('/api/pedidos', async (req, res) => {
-  try {
-    const pedidos = await Pedido.find().sort({ data: -1 });
-    res.json(pedidos);
-  } catch (error) {
-    console.error('Erro ao buscar pedidos:', error);
-    res.status(500).json({ success: false, message: 'Erro ao buscar pedidos' });
-  }
-});
-
-app.get('/api/pedidos/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const pedido = await Pedido.findById(id);
-
-    if (!pedido) {
-      return res.status(404).json({ success: false, message: 'Pedido não encontrado' });
-    }
-
-    res.json(pedido);
-  } catch (error) {
-    console.error('Erro ao buscar pedido:', error);
-    res.status(500).json({ success: false, message: 'Erro ao buscar pedido' });
-  }
-});
-
-// === Conversas ===
-app.get('/api/conversas', async (req, res) => {
-  try {
-    const conversas = await Conversa.find().sort({ inicio: -1 });
-    res.json(conversas);
-  } catch (error) {
-    console.error('Erro ao buscar conversas:', error);
-    res.status(500).json({ success: false, message: 'Erro ao buscar conversas' });
-  }
-});
-
-app.get('/api/conversas/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const conversa = await Conversa.findById(id);
-
-    if (!conversa) {
-      return res.status(404).json({ success: false, message: 'Conversa não encontrada' });
-    }
-
-    res.json(conversa);
-  } catch (error) {
-    console.error('Erro ao buscar conversa:', error);
-    res.status(500).json({ success: false, message: 'Erro ao buscar conversa' });
-  }
-});
-
-// === Configuração de Área de Entrega ===
-app.get('/api/delivery-config', async (req, res) => {
-  try {
-    const config = await DeliveryConfig.findOne();
-    res.json(config || {});
-  } catch (error) {
-    console.error('Erro ao buscar configuração de entrega:', error);
-    res.status(500).json({ success: false, message: 'Erro ao buscar configuração de entrega' });
-  }
-});
-
-app.post('/api/delivery-config', async (req, res) => {
-  try {
-    const config = await DeliveryConfig.findOne();
-    if (config) {
-      // Atualizar configuração existente
-      await DeliveryConfig.updateOne({}, req.body);
-    } else {
-      // Criar nova configuração
-      await DeliveryConfig.create(req.body);
-    }
-    res.json({ success: true, message: 'Configurações de entrega salvas com sucesso' });
-  } catch (error) {
-    console.error('Erro ao salvar configuração de entrega:', error);
-    res.status(500).json({ success: false, message: 'Erro ao salvar configuração de entrega' });
-  }
-});
-
-// === API Keys ===
-app.get('/api/api-keys/google-maps', async (req, res) => {
-  try {
-    const apiKeys = await ApiKeys.findOne();
-    res.json({ key: apiKeys ? apiKeys.googleMaps : '' });
-  } catch (error) {
-    console.error('Erro ao buscar chave da API:', error);
-    res.status(500).json({ success: false, message: 'Erro ao buscar chave da API' });
-  }
-});
-
-app.post('/api/api-keys/google-maps', async (req, res) => {
-  try {
-    const apiKeys = await ApiKeys.findOne();
-    if (apiKeys) {
-      // Atualizar chave existente
-      await ApiKeys.updateOne({}, { googleMaps: req.body.key });
-    } else {
-      // Criar nova chave
-      await ApiKeys.create({ googleMaps: req.body.key });
-    }
-    res.json({ success: true, message: 'Chave da API salva com sucesso' });
-  } catch (error) {
-    console.error('Erro ao salvar chave da API:', error);
-    res.status(500).json({ success: false, message: 'Erro ao salvar chave da API' });
-  }
-});
-
-// === Endpoint para validação de endereço para teste direto ===
-app.post('/api/validate-address', async (req, res) => {
-  const { address } = req.body;
-
-  if (!address) {
-    return res.status(400).json({
-      success: false,
-      message: 'Endereço não fornecido'
-    });
-  }
-
-  try {
-    // Validar endereço
-    const result = await validateAddress(address);
-    res.json(result);
-  } catch (error) {
-    console.error('Erro ao validar endereço:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Erro ao validar endereço'
-    });
-  }
-});
-
-// === Endpoint para gerar áudio sob demanda ===
-app.post('/api/generate-audio', async (req, res) => {
-  try {
-    const { text, pedidoId } = req.body;
-
-    if (!text && !pedidoId) {
-      return res.status(400).json({
-        success: false,
-        error: 'Texto ou ID de pedido é obrigatório'
-      });
-    }
-
-    // Determinar qual texto usar para gerar o áudio
-    let audioText = text;
-
-    // Se tiver um ID de pedido, buscar dados do pedido e gerar texto de confirmação
-    if (pedidoId) {
-      try {
-        const pedido = await Pedido.findById(pedidoId);
-        if (pedido) {
-          audioText = gerarTextoConfirmacaoPedido({
-            items: pedido.itens,
-            endereco: pedido.endereco,
-            pagamento: pedido.formaPagamento
-          });
-        }
-      } catch (pedidoError) {
-        console.error('Erro ao buscar pedido:', pedidoError);
-      }
-    }
-
-    if (!audioText) {
-      return res.status(400).json({
-        success: false,
-        error: 'Não foi possível gerar o texto para áudio'
-      });
-    }
-
-    console.log('Gerando áudio para texto:', audioText.substring(0, 50) + '...');
-
-    // Verificar se o diretório de mídia existe
-    const mediaDir = path.join(__dirname, 'public', 'media');
-    if (!fs.existsSync(mediaDir)) {
-      fs.mkdirSync(mediaDir, { recursive: true });
-    }
-
-    // Limpar o texto para garantir melhor qualidade de áudio
-    const cleanedText = audioText
-      .replace(/<\/?[^>]+(>|$)/g, "") // Remove tags HTML
-      .replace(/\*\*/g, "") // Remove negrito markdown
-      .replace(/\*/g, "") // Remove itálico markdown
-      .substring(0, 4000); // Limitar para evitar erro da API
-
-    // Verificar se temos a API KEY da OpenAI configurada
-    if (!process.env.OPENAI_API_KEY) {
-      console.error('API key da OpenAI não configurada');
-      return res.status(500).json({
-        success: false,
-        error: 'Serviço de áudio não configurado'
-      });
-    }
-
-    try {
-      // Inicializar OpenAI
-      const openai = new OpenAI({
-        apiKey: process.env.OPENAI_API_KEY
-      });
-
-      console.log("Iniciando geração de áudio com API OpenAI...");
-
-      const speech = await openai.audio.speech.create({
-        model: "tts-1",
-        voice: "ash",
-        input: `\u200B ${cleanedText}`,
-        response_format: "mp3"
-      });
-
-      console.log("Áudio gerado pela API OpenAI");
-
-      // Obter o buffer do áudio gerado
-      const arrayBuffer = await speech.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
-
-      console.log(`Buffer de áudio obtido: ${buffer.length} bytes`);
-
-      if (buffer.length === 0) {
-        throw new Error("API retornou um buffer vazio");
-      }
-
-      // Gerar um nome único para o arquivo
-      const filename = `speech-${Date.now()}.mp3`;
-      const audioPath = path.join(mediaDir, filename);
-
-      // Salvar o arquivo
-      fs.writeFileSync(audioPath, buffer);
-      console.log(`Áudio salvo em: ${audioPath}`);
-
-      // Verificar se o arquivo foi criado e tem conteúdo
-      if (fs.existsSync(audioPath)) {
-        const stats = fs.statSync(audioPath);
-        console.log(`Verificação do arquivo: ${audioPath}, tamanho: ${stats.size} bytes`);
-
-        if (stats.size > 0) {
-          // Gerar URL pública
-          const audioUrl = `/api/media/${filename}`;
-          console.log('URL do áudio gerada:', audioUrl);
-
-          return res.json({
-            success: true,
-            audio: audioUrl
-          });
-        } else {
-          throw new Error("Arquivo de áudio criado, mas está vazio");
-        }
-      } else {
-        throw new Error("Falha ao criar arquivo de áudio");
-      }
-    } catch (apiError) {
-      console.error('Erro detalhado na API de áudio:', apiError);
-      return res.status(500).json({
-        success: false,
-        error: 'Erro ao gerar áudio',
-        message: apiError.message
-      });
-    }
-  } catch (error) {
-    console.error('Erro geral ao gerar áudio:', error);
-    return res.status(500).json({
-      success: false,
-      error: 'Erro ao gerar áudio',
-      message: error.message
-    });
-  }
-});
-
-// Adicione uma nova rota para gerar áudio específico de um pedido usando OpenAI
-app.post('/api/pedido/:id/audio', async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    // Buscar o pedido
-    const pedido = await Pedido.findById(id);
-    if (!pedido) {
-      return res.status(404).json({
-        success: false,
-        error: 'Pedido não encontrado'
-      });
-    }
-
-    // Gerar texto de confirmação
-    const confirmationText = gerarTextoConfirmacaoPedido({
-      items: pedido.itens,
-      endereco: pedido.endereco,
-      pagamento: pedido.formaPagamento
-    });
-
-    // Verificar se o diretório de mídia existe
-    const mediaDir = path.join(__dirname, 'public', 'media');
-    if (!fs.existsSync(mediaDir)) {
-      fs.mkdirSync(mediaDir, { recursive: true });
-    }
-
-    // Limpar o texto
-    const cleanedText = confirmationText
-      .replace(/<\/?[^>]+(>|$)/g, "")
-      .replace(/\*\*/g, "")
-      .replace(/\*/g, "")
-      .substring(0, 4000);
-
-    // Verificar se temos a API KEY da OpenAI configurada
-    if (!process.env.OPENAI_API_KEY) {
-      console.error('API key da OpenAI não configurada');
-      return res.status(500).json({
-        success: false,
-        error: 'Serviço de áudio não configurado'
-      });
-    }
-
-    // Inicializar OpenAI
-    const openai = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY
-    });
-
-    console.log("Gerando áudio de pedido com OpenAI...");
-
-    const speech = await openai.audio.speech.create({
-      model: "tts-1",
-      voice: "ash",
-      input: `\u200B ${cleanedText}`,
-      response_format: "mp3"
-    });
-
-    // Obter buffer
-    const arrayBuffer = await speech.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
-    if (buffer.length === 0) {
-      throw new Error("API retornou um buffer vazio");
-    }
-
-    // Salvar arquivo
-    const filename = `speech-${Date.now()}.mp3`;
-    const audioPath = path.join(mediaDir, filename);
-    fs.writeFileSync(audioPath, buffer);
-
-    // Verificar arquivo
-    if (fs.existsSync(audioPath) && fs.statSync(audioPath).size > 0) {
-      const audioUrl = `/api/media/${filename}`;
-      return res.json({
-        success: true,
-        audio: audioUrl
-      });
-    } else {
-      throw new Error("Falha ao criar arquivo de áudio");
-    }
-  } catch (error) {
-    console.error('Erro ao gerar áudio do pedido:', error);
-    return res.status(500).json({
-      success: false,
-      error: 'Erro ao gerar áudio do pedido',
-      message: error.message
-    });
-  }
-});
-
-/**
- * Gera áudio a partir de texto
- * @param {String} text - Texto para converter em áudio
- * @returns {Promise<String>} - URL do áudio gerado ou null em caso de erro
- */
-async function generateAudio(text) {
-  try {
-    console.log("Gerando áudio para:", text.substring(0, 50) + "...");
-
-    // Verificar se o diretório de mídia existe
-    const mediaDir = path.join(__dirname, 'public', 'media');
-    if (!fs.existsSync(mediaDir)) {
-      fs.mkdirSync(mediaDir, { recursive: true });
-    }
-
-    // Limpar o texto para melhor qualidade de áudio
-    const cleanedText = text
-      .replace(/<\/?[^>]+(>|$)/g, "") // Remove tags HTML
-      .replace(/\*\*/g, "") // Remove negrito markdown
-      .replace(/\*/g, ""); // Remove itálico markdown
-
-    // Gerar áudio com OpenAI
-    const speech = await openai.audio.speech.create({
-      model: "tts-1",
-      voice: "ash",
-      input: `\u200B ${cleanedText}`,
-      response_format: "mp3"
-    });
-
-    // Processar resultado
-    const arrayBuffer = await speech.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
-    if (buffer.length === 0) {
-      throw new Error("API retornou um buffer vazio");
-    }
-
-    // Salvar arquivo
-    const filename = `speech-${Date.now()}.mp3`;
-    const audioPath = path.join(mediaDir, filename);
-    fs.writeFileSync(audioPath, buffer);
-
-    // Verificar se o arquivo foi criado corretamente
-    if (fs.existsSync(audioPath)) {
-      const stats = fs.statSync(audioPath);
-      console.log(`Arquivo de áudio criado: ${audioPath}, tamanho: ${stats.size} bytes`);
-
-      if (stats.size > 0) {
-        // URL do áudio
-        return `/api/media/${filename}`;
-      }
-    }
-
-    return null;
-  } catch (error) {
-    console.error('Erro detalhado ao gerar áudio:', error);
-    return null;
-  }
-}
-
-/**
- * Obtém o prompt do sistema a partir do banco de dados
- * @param {Object} botConfig - Configuração do bot
- * @param {Object} historia - História da pizzaria
- * @param {Array} cardapioItems - Itens do cardápio
- * @param {Array} formasPagamento - Formas de pagamento
- * @param {Number} currentState - Estado atual da conversa
- * @returns {Promise<String>} - Prompt do sistema completo
- */
+// Obtém o prompt do sistema a partir do banco de dados
 async function getSystemPromptFromDatabase(botConfig, historia, cardapioItems, formasPagamento, currentState, conversa = {}) {
   const promptStartTime = Date.now();
   console.log(`[${new Date().toISOString()}] Início da função getSystemPromptFromDatabase`);
@@ -1522,7 +571,6 @@ async function getSystemPromptFromDatabase(botConfig, historia, cardapioItems, f
       }
 
       // Substituir todos os placeholders conhecidos
-
       console.time('prompt_replacements');
 
       const replacements = {
@@ -1603,11 +651,7 @@ async function getSystemPromptFromDatabase(botConfig, historia, cardapioItems, f
   }
 }
 
-/**
- * Formata os itens do cardápio para inclusão no prompt
- * @param {Array} items - Itens do cardápio
- * @returns {String} - Texto formatado do cardápio
- */
+// Formatação de dados para o prompt
 function formatCardapioForPrompt(items) {
   try {
     let result = '';
@@ -1640,11 +684,6 @@ function formatCardapioForPrompt(items) {
   }
 }
 
-/**
- * Formata as formas de pagamento para inclusão no prompt
- * @param {Array} pagamentos - Formas de pagamento
- * @returns {String} - Texto formatado das formas de pagamento
- */
 function formatPagamentoForPrompt(pagamentos) {
   try {
     let result = '';
@@ -1660,51 +699,7 @@ function formatPagamentoForPrompt(pagamentos) {
   }
 }
 
-/**
- * Gera texto de confirmação do pedido a partir dos dados JSON
- * @param {Object} pedidoData - Dados do pedido
- * @returns {String} - Texto formatado de confirmação
- */
-function gerarTextoConfirmacaoPedido(pedidoData, conversa) {
-  try {
-    if (!pedidoData || !pedidoData.items || !pedidoData.endereco || !pedidoData.pagamento) {
-      return "Pedido confirmado! Obrigado pela preferência.";
-    }
-
-    // Determinar o endereço mais completo disponível
-    let endereco = pedidoData.endereco;
-    if (conversa && conversa.addressData && conversa.addressData.formattedAddress) {
-      endereco = conversa.addressData.formattedAddress;
-    }
-
-    let texto = "🎉 *PEDIDO CONFIRMADO* 🎉\n\n";
-    texto += "*Itens:*\n";
-
-    let total = 0;
-    pedidoData.items.forEach(item => {
-      const subtotal = parseFloat(item.preco) * (item.quantidade || 1);
-      texto += `- ${item.quantidade || 1}x *${item.nome}*: R$${parseFloat(item.preco).toFixed(2)} = R$${subtotal.toFixed(2)}\n`;
-      total += subtotal;
-    });
-
-    texto += `\n*Valor Total:* R$${total.toFixed(2)}\n`;
-    texto += `*Endereço de Entrega:* ${endereco}\n`;
-    texto += `*Forma de Pagamento:* ${pedidoData.pagamento}\n\n`;
-    texto += "Seu pedido será entregue em aproximadamente 50 minutos. Obrigado pela preferência! 🍕";
-
-    return texto;
-  } catch (error) {
-    console.error('Erro ao gerar texto de confirmação:', error);
-    return "Pedido confirmado! Obrigado pela preferência.";
-  }
-}
-
-// === Endpoint para WhatsApp Bot ===
-/**
- * Detecta se o usuário está pedindo uma ou mais imagens específicas
- * @param {string} message - Mensagem do usuário
- * @returns {string[]|null} - Retorna array de identificadores de imagem ou null
- */
+// Detecta pedidos por imagens específicas
 function detectImageRequest(message) {
   message = message.toLowerCase();
 
@@ -1725,9 +720,9 @@ function detectImageRequest(message) {
   // Lista REAL das pizzas com seus identificadores corretos
   const pizzaTypes = [
     { name: 'amazonas', id: 'pizza-salgada_pizza-amazonas' },
-    { name: 'porco & pinhão', id: 'pizza-salgada_pizza-porco-&-pinhao' },
-    { name: 'porco e pinhão', id: 'pizza-salgada_pizza-porco-&-pinhao' },
-    { name: 'porco e pinhao', id: 'pizza-salgada_pizza-porco-&-pinhao' },
+    { name: 'porco & pinhão', id: 'pizza-salgada_pizza-porco-e-pinhao' },
+    { name: 'porco e pinhão', id: 'pizza-salgada_pizza-porco-e-pinhao' },
+    { name: 'porco e pinhao', id: 'pizza-salgada_pizza-porco-e-pinhao' },
     { name: 'tropicale', id: 'pizza-salgada_pizza-tropicale' },
     { name: 'napolitana paulistana', id: 'pizza-salgada_pizza-napolitana-paulistana' },
     { name: 'cerrado brasileiro', id: 'pizza-salgada_pizza-cerrado-brasileiro' },
@@ -1780,7 +775,7 @@ function detectImageRequest(message) {
     }
   }
 
-  // NOVO: Verificar múltiplas pizzas mencionadas
+  // Verificar múltiplas pizzas mencionadas
   // Verificar se a mensagem contém "e" ou vírgulas, indicando múltiplos pedidos
   const multipleRequest = message.includes(' e ') ||
     message.includes(',') ||
@@ -1808,12 +803,7 @@ function detectImageRequest(message) {
   return null;
 }
 
-/**
- * Função para sobrepor duas imagens de URLs (primeira sobre a segunda)
- * @param {string} baseImageUrl - URL da imagem de fundo (imagemDireita do sabor 2)
- * @param {string} overlayImageUrl - URL da imagem para sobrepor (imagemEsquerda do sabor 1)
- * @returns {Promise<string>} - Imagem base64 combinada
- */
+// Processar imagens de pizza meio a meio
 async function overlayImages(baseImageUrl, overlayImageUrl) {
   // Importar o módulo canvas
   const { createCanvas, loadImage } = require('canvas');
@@ -1871,85 +861,197 @@ async function overlayImages(baseImageUrl, overlayImageUrl) {
   }
 }
 
-/**
- * Download de mídia (áudio ou imagem)
- * @param {String} url - URL da mídia para download
- * @param {String} type - Tipo de mídia ('audio' ou 'image')
- * @returns {Promise<String|null>} - Caminho do arquivo salvo ou null em caso de erro
- */
-async function downloadMedia(url, type) {
+// Gerar texto de confirmação do pedido
+function gerarTextoConfirmacaoPedido(pedidoData, conversa) {
   try {
-    console.log(`Iniciando download de ${type} de: ${url}`);
+    if (!pedidoData || !pedidoData.items || !pedidoData.endereco || !pedidoData.pagamento) {
+      return "Pedido confirmado! Obrigado pela preferência.";
+    }
 
-    // Verificar se a URL é relativa (começa com /)
-    const fullUrl = url.startsWith('/')
-      ? `${API_URL.replace('/api', '')}${url}`
-      : url;
+    // Determinar o endereço mais completo disponível
+    let endereco = pedidoData.endereco;
+    if (conversa && conversa.addressData && conversa.addressData.formattedAddress) {
+      endereco = conversa.addressData.formattedAddress;
+    }
 
-    console.log(`URL completa para download: ${fullUrl}`);
+    let texto = "🎉 *PEDIDO CONFIRMADO* 🎉\n\n";
+    texto += "*Itens:*\n";
 
-    // Baixar arquivo
-    const response = await axios({
-      method: 'get',
-      url: fullUrl,
-      responseType: 'arraybuffer',
-      headers: {
-        'Accept': '*/*' // Aceitar qualquer tipo de conteúdo
-      }
+    let total = 0;
+    pedidoData.items.forEach(item => {
+      const subtotal = parseFloat(item.preco) * (item.quantidade || 1);
+      texto += `- ${item.quantidade || 1}x *${item.nome}*: R$${parseFloat(item.preco).toFixed(2)} = R$${subtotal.toFixed(2)}\n`;
+      total += subtotal;
     });
 
-    // Verificar a resposta
-    if (!response.data || response.data.length === 0) {
-      console.error('Download concluído, mas sem dados');
-      return null;
-    }
+    texto += `\n*Valor Total:* R$${total.toFixed(2)}\n`;
+    texto += `*Endereço de Entrega:* ${endereco}\n`;
+    texto += `*Forma de Pagamento:* ${pedidoData.pagamento}\n\n`;
+    texto += "Seu pedido será entregue em aproximadamente 50 minutos. Obrigado pela preferência! 🍕";
 
-    console.log(`Download concluído. Tamanho: ${response.data.length} bytes, Tipo: ${response.headers['content-type'] || 'não especificado'}`);
-
-    // Gerar nome de arquivo único
-    const mediaDir = path.join(__dirname, 'public', 'media');
-    const extension = type === 'audio' ? 'mp3' : 'jpg';
-    const filename = `${type}_${Date.now()}.${extension}`;
-    const filePath = path.join(mediaDir, filename);
-
-    // Garantir que o diretório existe
-    if (!fs.existsSync(mediaDir)) {
-      fs.mkdirSync(mediaDir, { recursive: true });
-    }
-
-    // Salvar arquivo
-    fs.writeFileSync(filePath, response.data);
-    console.log(`Arquivo salvo em: ${filePath}`);
-
-    // Verificar o arquivo salvo
-    const stats = fs.statSync(filePath);
-    console.log(`Verificação do arquivo: ${filePath}, tamanho: ${stats.size} bytes`);
-
-    if (stats.size === 0) {
-      console.error('Arquivo salvo está vazio');
-      return null;
-    }
-
-    return filePath;
+    return texto;
   } catch (error) {
-    console.error(`Erro detalhado ao fazer download de ${type}:`, error);
-    if (error.response) {
-      console.error(`Status: ${error.response.status}, Dados: ${typeof error.response.data}`);
-    }
-    return null;
+    console.error('Erro ao gerar texto de confirmação:', error);
+    return "Pedido confirmado! Obrigado pela preferência.";
   }
 }
 
-const tempPedidoData = new Map();
+// Checagem de avanço de estado no fluxo de conversa
+function checkIfShouldAdvanceState(botResponse, userMessage, currentState, conversa) {
+  try {
+    // Lógica básica para determinar se deve avançar de estado
+    const userMsg = userMessage ? userMessage.toLowerCase() : '';
 
-/**
- * Processa a resposta do modelo com base nas tags
- * @param {String} botResponse - Resposta original do modelo
- * @param {String} userMessage - Mensagem do usuário
- * @param {Object} conversa - Objeto da conversa
- * @param {Object} botConfig - Configuração do bot
- * @returns {Object} - Objeto com a resposta processada para o cliente
- */
+    // Logs para debugging
+    console.log(`Verificando avanço de estado. Estado atual: ${currentState}`);
+    console.log(`Mensagem do usuário: "${userMsg.substring(0, 50)}..."`);
+
+    // Retornar valores concretos em vez de undefined
+    switch (currentState) {
+      case 0: // Escolha de sabor
+        // Verificar sabores específicos ou pedido direto
+        const hasPizzaRequest = userMsg.includes('pizza') ||
+          userMsg.includes('tropicale') ||
+          userMsg.includes('amazonas') ||
+          userMsg.includes('napolitana') ||
+          userMsg.includes('pedido') ||
+          userMsg.includes('quero') ||
+          userMsg.includes('manda');
+
+        console.log(`Estado 0 - Deve avançar? ${hasPizzaRequest} (pedido de pizza detectado)`);
+        return hasPizzaRequest;
+
+      case 1: // Inteira ou meio a meio
+        // Verificar se a mensagem atual ou a mensagem inicial já contém as informações necessárias
+        const shouldAdvance1 = userMsg.includes('inteira') ||
+          userMsg.includes('meio') ||
+          userMsg.includes('metade') ||
+          // Adicionar checagem para ver se já temos sabor e tamanho informados
+          (botResponse.toLowerCase().includes('pizza') &&
+            (botResponse.toLowerCase().includes('grande') ||
+              botResponse.toLowerCase().includes('média') ||
+              botResponse.toLowerCase().includes('pequena') ||
+              botResponse.toLowerCase().includes('familia')));
+
+        // Verificar se o LLM está perguntando sobre tamanho ou tipo
+        const isAskingForSize = botResponse.toLowerCase().includes('tamanho') ||
+          botResponse.toLowerCase().includes('grande') ||
+          botResponse.toLowerCase().includes('média') ||
+          botResponse.toLowerCase().includes('pequena');
+
+        const isAskingForType = botResponse.toLowerCase().includes('inteira') ||
+          botResponse.toLowerCase().includes('meio a meio');
+
+        // Se o LLM já está perguntando sobre tamanho ou tipo, considerar que já temos as informações básicas
+        if (isAskingForSize || isAskingForType) {
+          console.log('LLM já está perguntando sobre tamanho ou tipo, considerando avanço');
+          return true;
+        }
+
+        console.log(`Estado 1 - Deve avançar? ${shouldAdvance1}`);
+        return shouldAdvance1;
+
+      case 2: // Mais pizza ou finalizar
+        const shouldAdvance2 = userMsg.includes('finalizar') ||
+          userMsg.includes('mais uma') ||
+          userMsg.includes('outra pizza');
+        console.log(`Estado 2 - Deve avançar? ${shouldAdvance2}`);
+        return shouldAdvance2;
+
+      case 3: // Bebidas
+        const shouldAdvance3 = userMsg.includes('sim') ||
+          userMsg.includes('não') ||
+          userMsg.includes('nao') ||
+          userMsg.includes('refrigerante') ||
+          userMsg.includes('guaraná') ||
+          userMsg.includes('guarana') ||
+          userMsg.includes('coca') ||
+          userMsg.includes('sem refrigerante') ||
+          userMsg.includes('sem bebida');
+        console.log(`Estado 3 - Deve avançar? ${shouldAdvance3}`);
+        return shouldAdvance3;
+
+      case 4: // Endereço - Exigir número
+        // Verificar se tem CEP
+        const hasCEP = /\d{5}-?\d{3}/.test(userMsg);
+
+        // Verificar se tem número de endereço
+        const hasNumber = /\d+/.test(userMsg);
+
+        console.log(`Estado 4 - Tem CEP? ${hasCEP}, Tem número? ${hasNumber}`);
+
+        // Se tem CEP, mas não detectou número específico, verificar o contexto
+        if (hasCEP) {
+          // Se tiver um número após uma vírgula, considerar como número de endereço
+          const commaNumberMatch = userMsg.match(/,\s*(\d+)/);
+          if (commaNumberMatch) {
+            const addressNumber = commaNumberMatch[1];
+            console.log(`Estado 4 - Número após vírgula detectado: ${addressNumber}`);
+            return true; // Avançar estado
+          }
+        }
+
+        // Verificar se é uma resposta específica para a pergunta sobre número
+        if (userMsg.match(/^\s*\d+\s*$/) && currentState === 4) {
+          console.log(`Estado 4 - Resposta específica com número: ${userMsg.trim()}`);
+          return true; // Se é apenas um número, provavelmente é resposta ao pedido de número
+        }
+
+        if (hasNumber) {
+          return true; // Só avança se tiver número
+        }
+        return false;
+
+      case 5: // Pagamento
+        const shouldAdvance5 = userMsg.includes('débito') ||
+          userMsg.includes('debito') ||
+          userMsg.includes('crédito') ||
+          userMsg.includes('credito') ||
+          userMsg.includes('dinheiro') ||
+          userMsg.includes('pix') ||
+          userMsg.includes('vr');
+        console.log(`Estado 5 - Deve avançar? ${shouldAdvance5}`);
+        return shouldAdvance5;
+
+      case 6: // Confirmação
+        // Se o usuário confirma o pedido
+        const userConfirms = userMessage.toLowerCase().includes('sim') ||
+          userMessage.toLowerCase().includes('confirmo') ||
+          userMessage.toLowerCase().includes('correto') ||
+          userMessage.toLowerCase().includes('ok') ||
+          userMessage.toLowerCase().includes('pode ser');
+
+        // Verificar se o LLM usou a tag de confirmação final
+        const hasConfirmationTag = botResponse.includes('[CONFIRMATION_FORMAT]');
+
+        // Verificar se temos dados de pedido válidos na conversa
+        const hasPedidoData = conversa && conversa.pedidoData &&
+          conversa.pedidoData.items &&
+          conversa.pedidoData.endereco &&
+          conversa.pedidoData.pagamento;
+
+        console.log(`Estado 6 - Usuário confirmou? ${userConfirms}, Tem tag de confirmação? ${hasConfirmationTag}, Tem dados de pedido? ${hasPedidoData}`);
+
+        // Avançar estado apenas se todas as condições forem atendidas
+        const shouldAdvance6 = userConfirms && hasConfirmationTag && hasPedidoData;
+        console.log(`Estado 6 - Deve avançar? ${shouldAdvance6}`);
+        return shouldAdvance6;
+
+      case 7: // Pedido já confirmado - não avançar mais
+        console.log('Estado 7 - Pedido já confirmado, não avançar mais');
+        return false;
+
+      default:
+        console.log(`Estado desconhecido: ${currentState}, não avançar`);
+        return false;
+    }
+  } catch (error) {
+    console.error('Erro na função checkIfShouldAdvanceState:', error);
+    return false; // Em caso de erro, não avançar o estado
+  }
+}
+
+// Processar resposta com tags formatadas
 async function processTaggedResponse(botResponse, userMessage, conversa, botConfig) {
   const processStartTime = Date.now();
   console.log(`[${new Date().toISOString()}] Iniciando processamento de resposta formatada para conversa ${conversa?._id}`);
@@ -2435,7 +1537,7 @@ async function processTaggedResponse(botResponse, userMessage, conversa, botConf
           responseObj.imageCaption = botConfig.confirmationImageCaption || 'Pedido Confirmado';
         }
 
-        return; // Sair da função para evitar processamento adicional
+        return responseObj; // Sair da função para evitar processamento adicional
       }
 
       // Usar os dados já armazenados na conversa
@@ -2463,7 +1565,7 @@ async function processTaggedResponse(botResponse, userMessage, conversa, botConf
             conversa.state = 4;
             await conversa.save();
 
-            return; // Sair da função para evitar processamento adicional
+            return responseObj; // Sair da função para evitar processamento adicional
           }
         }
 
@@ -2553,12 +1655,7 @@ async function processTaggedResponse(botResponse, userMessage, conversa, botConf
   return responseObj;
 }
 
-/**
- * Extrai dados de pedido de uma resposta formatada
- * @param {string} text - Texto contendo possíveis tags JSON_FORMAT
- * @param {object} conversa - Objeto da conversa atual
- * @returns {object|null} - Dados do pedido extraídos ou null se não encontrados
- */
+// Extrai dados de pedido de uma resposta formatada
 async function extractPedidoData(text, conversa) {
   // Buscar tag JSON_FORMAT
   const jsonMatch = text.match(/\[JSON_FORMAT\]([\s\S]*?)\[\/END\]/);
@@ -2598,43 +1695,218 @@ async function extractPedidoData(text, conversa) {
   }
 }
 
-app.post('/api/message', async (req, res) => {
+// Gerar áudio a partir de texto
+async function generateAudio(text) {
   try {
-    const apiRequestStartTime = Date.now();
-    console.log(`[${new Date().toISOString()}] API: Iniciando processamento para ${req.body.phone}`);
+    console.log("Gerando áudio para:", text.substring(0, 50) + "...");
 
-    console.log('Recebido no /api/message:', JSON.stringify(req.body));
-    const { phone, message, isAudio, messageType, isFirstMessage, timestamp } = req.body;
-
-    // Validação básica de entrada
-    if (!phone) {
-      return res.status(400).json({
-        success: false,
-        error: 'Número de telefone é obrigatório'
-      });
+    // Verificar se o diretório de mídia existe
+    const mediaDir = path.join(__dirname, 'public', 'media');
+    if (!fs.existsSync(mediaDir)) {
+      fs.mkdirSync(mediaDir, { recursive: true });
     }
 
-    if (message === undefined || message === null) {
-      return res.status(400).json({
-        success: false,
-        error: 'Mensagem é obrigatória'
-      });
+    // Limpar o texto para melhor qualidade de áudio
+    const cleanedText = text
+      .replace(/<\/?[^>]+(>|$)/g, "") // Remove tags HTML
+      .replace(/\*\*/g, "") // Remove negrito markdown
+      .replace(/\*/g, ""); // Remove itálico markdown
+
+    // Gerar áudio com OpenAI
+    const speech = await openai.audio.speech.create({
+      model: "tts-1",
+      voice: "ash",
+      input: `\u200B ${cleanedText}`,
+      response_format: "mp3"
+    });
+
+    // Processar resultado
+    const arrayBuffer = await speech.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    if (buffer.length === 0) {
+      throw new Error("API retornou um buffer vazio");
     }
 
+    // Salvar arquivo
+    const filename = `speech-${Date.now()}.mp3`;
+    const audioPath = path.join(mediaDir, filename);
+    fs.writeFileSync(audioPath, buffer);
+
+    // Verificar se o arquivo foi criado corretamente
+    if (fs.existsSync(audioPath)) {
+      const stats = fs.statSync(audioPath);
+      console.log(`Arquivo de áudio criado: ${audioPath}, tamanho: ${stats.size} bytes`);
+
+      if (stats.size > 0) {
+        // URL do áudio
+        return `/api/media/${filename}`;
+      }
+    }
+
+    return null;
+  } catch (error) {
+    console.error('Erro detalhado ao gerar áudio:', error);
+    return null;
+  }
+}
+
+// ======== FUNÇÕES ESPECÍFICAS DO WHATSAPP BOT ==========
+
+// Processar mensagem de texto para o WhatsApp
+async function processTextMessage(userPhone, text) {
+  // Conjunto para rastrear imagens já enviadas
+  const sentImages = new Set();
+
+  try {
+    // Verificar primeiro se é um pedido específico de áudio
+    const audioProcessed = await handleAudioRequest(userPhone, text);
+    if (audioProcessed) {
+      console.log('Pedido de áudio processado com sucesso');
+      return;
+    }
+
+    // Buscar ou criar conversa para o usuário
+    let conversa = await getOrCreateConversation(userPhone, text);
+    if (!conversa) {
+      console.error('Não foi possível criar ou obter uma conversa válida');
+      await client.sendMessage(userPhone, "Desculpe, ocorreu um erro ao processar sua mensagem. Por favor, tente novamente.");
+      return;
+    }
+
+    // Verificar se há um pedido de reinicialização
+    if (text.toLowerCase() === 'reiniciar' ||
+      text.toLowerCase() === 'começar de novo' ||
+      text.toLowerCase() === 'novo pedido') {
+      await handleResetRequest(userPhone);
+      return;
+    }
+
+    // Processar a mensagem com a API interna
+    const apiResponse = await processMessageInternally(userPhone, text, false, 'text', conversa);
+
+    // Verificar se temos uma resposta válida
+    if (!apiResponse || !apiResponse.success) {
+      await client.sendMessage(userPhone, "Desculpe, ocorreu um erro ao processar sua mensagem. Por favor, tente novamente.");
+      return;
+    }
+
+    // Enviar texto (blocos [TEXT_FORMAT])
+    if (apiResponse.text) {
+      // Extrair e enviar blocos de texto
+      const textBlocks = apiResponse.text.match(/\[TEXT_FORMAT\]([\s\S]*?)\[\/END\]/g) || [];
+      for (const block of textBlocks) {
+        const cleanText = block.replace(/\[TEXT_FORMAT\]|\[\/END\]/g, '').trim();
+        if (cleanText) {
+          await client.sendMessage(userPhone, cleanText);
+        }
+      }
+    }
+
+    // Processar áudio
+    if (apiResponse.audio) {
+      try {
+        const audioPath = await downloadMedia(apiResponse.audio, 'audio');
+        if (audioPath) {
+          const media = MessageMedia.fromFilePath(audioPath);
+          await client.sendMessage(userPhone, media, {
+            sendAudioAsVoice: true,
+            mimetype: 'audio/mp3'
+          });
+
+          // Limpar arquivo temporário
+          fs.unlinkSync(audioPath);
+        }
+      } catch (audioError) {
+        console.error('Erro ao processar áudio:', audioError);
+      }
+    }
+
+    // Processar imagem principal
+    if (apiResponse.image && !sentImages.has(apiResponse.image)) {
+      try {
+        if (apiResponse.image.startsWith('data:image')) {
+          const matches = apiResponse.image.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+          if (matches && matches.length === 3) {
+            const mediaType = matches[1];
+            const mediaData = matches[2];
+            const caption = apiResponse.imageCaption || '';
+
+            const media = new MessageMedia(mediaType, mediaData);
+            await client.sendMessage(userPhone, media, { caption });
+            sentImages.add(apiResponse.image);
+          }
+        } else {
+          const imagePath = await downloadMedia(apiResponse.image, 'image');
+          if (imagePath) {
+            const media = MessageMedia.fromFilePath(imagePath);
+            await client.sendMessage(userPhone, media, { caption: apiResponse.imageCaption || '' });
+            sentImages.add(apiResponse.image);
+            fs.unlinkSync(imagePath);
+          }
+        }
+      } catch (imageError) {
+        console.error('Erro ao enviar imagem principal:', imageError);
+      }
+    }
+
+    // Processar imagens adicionais do array allImages
+    if (apiResponse.allImages && apiResponse.allImages.length > 0) {
+      for (const imgData of apiResponse.allImages) {
+        if (imgData.url && !sentImages.has(imgData.url)) {
+          try {
+            if (imgData.url.startsWith('data:image')) {
+              const matches = imgData.url.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+              if (matches && matches.length === 3) {
+                const mediaType = matches[1];
+                const mediaData = matches[2];
+                const caption = imgData.caption || '';
+
+                const media = new MessageMedia(mediaType, mediaData);
+                await client.sendMessage(userPhone, media, { caption });
+                sentImages.add(imgData.url);
+              }
+            } else {
+              const imagePath = await downloadMedia(imgData.url, 'image');
+              if (imagePath) {
+                const media = MessageMedia.fromFilePath(imagePath);
+                await client.sendMessage(userPhone, media, { caption: imgData.caption || '' });
+                sentImages.add(imgData.url);
+                fs.unlinkSync(imagePath);
+              }
+            }
+          } catch (error) {
+            console.error(`Erro ao processar imagem adicional ${imgData.id}:`, error);
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Erro ao processar mensagem de texto:', error);
+    await client.sendMessage(userPhone, 'Desculpe, ocorreu um erro ao processar sua mensagem.');
+  } finally {
+    // Limpar o conjunto de imagens enviadas
+    sentImages.clear();
+  }
+}
+
+// Buscar ou criar conversa para um usuário
+async function getOrCreateConversation(userPhone, message) {
+  try {
     // Verificar se há pedido de reiniciar
     const isResetRequest = message.toLowerCase() === 'reiniciar' ||
       message.toLowerCase() === 'começar de novo' ||
       message.toLowerCase() === 'novo pedido';
 
     // Buscar a conversa mais recente para este telefone
-    let conversa = await Conversa.findOne({ telefone: phone }).sort({ inicio: -1 });
+    let conversa = await Conversa.findOne({ telefone: userPhone }).sort({ inicio: -1 });
     let novaConversaCriada = false;
 
     // LÓGICA DE CRIAÇÃO DE NOVA CONVERSA
     if (isResetRequest) {
       // Criar nova conversa em caso de reinício explícito
       conversa = new Conversa({
-        telefone: phone,
+        telefone: userPhone,
         inicio: new Date().toISOString(),
         duracao: 0,
         state: 0,
@@ -2649,7 +1921,7 @@ app.post('/api/message', async (req, res) => {
       if (conversa.state === 7 || (new Date() - new Date(conversa.inicio)) > 3 * 60 * 60 * 1000) { // 3 horas
         // Criar nova conversa para novo pedido
         conversa = new Conversa({
-          telefone: phone,
+          telefone: userPhone,
           inicio: new Date().toISOString(),
           duracao: 0,
           state: 0,
@@ -2663,7 +1935,7 @@ app.post('/api/message', async (req, res) => {
     else {
       // Se não existir nenhuma conversa, criar a primeira
       conversa = new Conversa({
-        telefone: phone,
+        telefone: userPhone,
         inicio: new Date().toISOString(),
         duracao: 0,
         state: 0,
@@ -2674,82 +1946,229 @@ app.post('/api/message', async (req, res) => {
       console.log('Primeira conversa criada:', conversa._id);
     }
 
-    // Se criou nova conversa e é pedido de reinício, retornar mensagem específica
-    if (novaConversaCriada && isResetRequest) {
-      try {
-        // Adicionar a primeira mensagem na nova conversa
-        conversa.mensagens.push({
-          tipo: 'user',
-          conteudo: message,
-          data: timestamp || new Date().toISOString()
-        });
+    return conversa;
+  } catch (error) {
+    console.error('Erro ao buscar/criar conversa:', error);
+    return null;
+  }
+}
 
-        // Buscar a mensagem de boas-vindas COMPLETA do banco de dados
-        const botConfig = await BotConfig.findOne().select('welcomeMessage');
+// Tratar pedido de áudio 
+async function handleAudioRequest(userPhone, message) {
+  try {
+    // Verificar se é um pedido explícito de áudio
+    if (!message.toLowerCase().includes('audio') &&
+      !message.toLowerCase().includes('áudio') &&
+      !message.toLowerCase().includes('ouvir') &&
+      !message.toLowerCase().includes('escutar')) {
+      return false;
+    }
 
-        console.log('Buscando mensagem de boas-vindas para reinício...');
+    console.log(`Detectado pedido de áudio de ${userPhone}: ${message}`);
 
-        // Verificar se temos uma mensagem de boas-vindas válida
-        if (!botConfig || !botConfig.welcomeMessage) {
-          console.error('Mensagem de boas-vindas não encontrada no banco de dados');
-        } else {
-          console.log('Mensagem de boas-vindas encontrada: ', botConfig.welcomeMessage.substring(0, 50) + '...');
+    // Verificar se é um pedido de áudio para a confirmação do pedido
+    const isConfirmationAudio =
+      message.toLowerCase().includes('confirmação') ||
+      message.toLowerCase().includes('confirmado') ||
+      message.toLowerCase().includes('pedido');
+
+    if (isConfirmationAudio) {
+      // Buscar a conversa atual
+      const conversa = await Conversa.findOne({ telefone: userPhone }).sort({ inicio: -1 });
+      if (!conversa || !conversa.pedidoData) {
+        await client.sendMessage(userPhone,
+          "Desculpe, não encontrei dados de pedido para gerar o áudio. Por favor, faça seu pedido primeiro.");
+        return true;
+      }
+
+      // Gerar texto de confirmação baseado nos dados do pedido
+      const confirmationText = gerarTextoConfirmacaoPedido(conversa.pedidoData, conversa);
+
+      // Gerar áudio
+      const audioUrl = await generateAudio(confirmationText);
+      if (audioUrl) {
+        const audioPath = await downloadMedia(audioUrl, 'audio');
+        if (audioPath) {
+          const media = MessageMedia.fromFilePath(audioPath);
+          await client.sendMessage(userPhone, media, {
+            sendAudioAsVoice: true,
+            mimetype: 'audio/mp3'
+          });
+
+          // Limpar arquivo temporário
+          fs.unlinkSync(audioPath);
         }
+      } else {
+        await client.sendMessage(userPhone,
+          "Desculpe, não consegui gerar o áudio da confirmação neste momento. " +
+          "Seu pedido foi registrado e será entregue em aproximadamente 50 minutos.");
+      }
 
-        // Usar a mensagem do banco ou uma mensagem padrão como fallback
-        let welcomeMessage = (botConfig && botConfig.welcomeMessage)
-          ? botConfig.welcomeMessage
-          : "Olá! Sou o atendente virtual da pizzaria. Como posso ajudar?";
+      return true;
+    }
 
-        // GARANTIR QUE A MENSAGEM TENHA A FORMATAÇÃO CORRETA
-        // Verificar se a mensagem já tem as tags de formatação
-        if (!welcomeMessage.includes('[TEXT_FORMAT]') && !welcomeMessage.includes('[/END]')) {
-          console.log('Adicionando tags de formatação à mensagem de boas-vindas');
-          welcomeMessage = `[TEXT_FORMAT]${welcomeMessage}[/END]`;
-        }
+    return false;
+  } catch (error) {
+    console.error('Erro ao processar pedido de áudio:', error);
+    return false;
+  }
+}
 
-        console.log('Usando mensagem formatada: ', welcomeMessage.substring(0, 50) + '...');
+// Processar mensagem de áudio no WhatsApp
+async function processAudioMessage(userPhone, media) {
+  console.log(`Nova mensagem de áudio de ${userPhone}`);
 
-        // Adicionar a mensagem ao histórico da conversa
-        conversa.mensagens.push({
-          tipo: 'bot',
-          conteudo: welcomeMessage,
-          data: new Date().toISOString()
-        });
+  try {
+    // Verificar se a API Key da OpenAI está configurada
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error("API key da OpenAI não configurada");
+    }
 
-        await conversa.save();
-        console.log('Conversa salva com mensagem de boas-vindas');
+    // Salvar o áudio temporariamente
+    const audioPath = `${MEDIA_PATH}/audio_received_${Date.now()}.ogg`;
 
-        // Processar a mensagem de boas-vindas para extrair imagens, áudio, etc.
-        const processedResponse = await processTaggedResponse(welcomeMessage, message, conversa, botConfig);
+    // Verificar se o diretório existe
+    if (!fs.existsSync(MEDIA_PATH)) {
+      fs.mkdirSync(MEDIA_PATH, { recursive: true });
+    }
 
-        // Verificar se o processamento gerou uma resposta de texto
-        if (!processedResponse.text && welcomeMessage) {
-          // Se não tiver texto na resposta processada, usar a mensagem original sem as tags
-          processedResponse.text = welcomeMessage
-            .replace('[TEXT_FORMAT]', '')
-            .replace('[/END]', '')
-            .trim();
+    // Garantir que media.data seja uma string base64 válida
+    if (!media || !media.data) {
+      throw new Error("Dados de áudio inválidos");
+    }
 
-          console.log('Adicionando texto à resposta final:', processedResponse.text.substring(0, 50) + '...');
-        }
+    const audioDataBuffer = Buffer.from(media.data, 'base64');
+    fs.writeFileSync(audioPath, audioDataBuffer);
 
-        return res.json({
-          success: true,
-          ...processedResponse,
-          state: 0
-        });
-      } catch (error) {
-        console.error('Erro ao buscar mensagem de boas-vindas:', error);
+    console.log(`Áudio salvo em: ${audioPath}`);
 
-        // Fallback em caso de erro
-        return res.json({
-          success: true,
-          text: "Olá! Seu atendimento foi reiniciado. Como posso ajudar?",
-          state: 0
-        });
+    // Transcrever o áudio com OpenAI
+    try {
+      const transcript = await openai.audio.transcriptions.create({
+        file: fs.createReadStream(audioPath),
+        model: "whisper-1",
+        response_format: "json"
+      });
+
+      console.log(`Áudio transcrito com sucesso: ${transcript.text}`);
+
+      // Processar a transcrição como mensagem de texto
+      if (transcript && transcript.text) {
+        await processTextMessage(userPhone, transcript.text);
+      } else {
+        throw new Error("Transcrição vazia ou inválida");
+      }
+    } catch (transcriptionError) {
+      console.error('Erro na transcrição:', transcriptionError);
+      throw transcriptionError;
+    }
+
+    // Limpar arquivo temporário
+    try {
+      fs.unlinkSync(audioPath);
+      console.log(`Arquivo temporário ${audioPath} removido com sucesso`);
+    } catch (cleanupError) {
+      console.error("Erro ao limpar arquivo temporário:", cleanupError);
+    }
+  } catch (error) {
+    console.error('Erro ao processar áudio:', error);
+    await client.sendMessage(userPhone, 'Não consegui entender o áudio. Pode tentar novamente ou enviar uma mensagem de texto?');
+  }
+}
+
+// Processar reinicialização de pedido
+async function handleResetRequest(userPhone) {
+  try {
+    // Criar nova conversa
+    const conversa = new Conversa({
+      telefone: userPhone,
+      inicio: new Date().toISOString(),
+      duracao: 0,
+      state: 0,
+      mensagens: []
+    });
+
+    // Salvar a nova conversa
+    await conversa.save();
+    console.log('Nova conversa criada por pedido de reinício:', conversa._id);
+
+    // Buscar a mensagem de boas-vindas
+    const botConfig = await BotConfig.findOne().select('welcomeMessage');
+    const welcomeMessage = (botConfig && botConfig.welcomeMessage)
+      ? botConfig.welcomeMessage
+      : "Olá! Sou o atendente virtual da pizzaria. Como posso ajudar?";
+
+    // Garantir que a mensagem de boas-vindas tem o formato correto
+    let formattedWelcome = welcomeMessage;
+    if (!formattedWelcome.includes('[TEXT_FORMAT]')) {
+      formattedWelcome = `[TEXT_FORMAT]${formattedWelcome}[/END]`;
+    }
+
+    // Adicionar mensagem do usuário
+    conversa.mensagens.push({
+      tipo: 'user',
+      conteudo: 'reiniciar',
+      data: new Date().toISOString()
+    });
+
+    // Adicionar mensagem de resposta ao histórico
+    conversa.mensagens.push({
+      tipo: 'bot',
+      conteudo: formattedWelcome,
+      data: new Date().toISOString()
+    });
+
+    await conversa.save();
+
+    // Processar a mensagem para enviar ao usuário
+    const processedResponse = await processTaggedResponse(formattedWelcome, 'reiniciar', conversa, botConfig);
+
+    // Texto principal
+    const textBlocks = processedResponse.text.match(/\[TEXT_FORMAT\]([\s\S]*?)\[\/END\]/g) || [];
+    for (const block of textBlocks) {
+      const cleanText = block.replace(/\[TEXT_FORMAT\]|\[\/END\]/g, '').trim();
+      if (cleanText) {
+        await client.sendMessage(userPhone, cleanText);
       }
     }
+
+    return true;
+  } catch (error) {
+    console.error('Erro ao reiniciar conversa:', error);
+    await client.sendMessage(userPhone, 'Desculpe, ocorreu um erro ao reiniciar. Por favor, tente novamente.');
+    return false;
+  }
+}
+
+// Função interna para processar mensagens
+async function processMessageInternally(userPhone, message, isAudio = false, messageType = 'text', conversa) {
+  try {
+    const apiRequestStartTime = Date.now();
+    console.log(`[${new Date().toISOString()}] Iniciando processamento para ${userPhone}`);
+
+    // Validação básica de entrada
+    if (!userPhone) {
+      throw new Error('Número de telefone é obrigatório');
+    }
+
+    if (message === undefined || message === null) {
+      throw new Error('Mensagem é obrigatória');
+    }
+
+    // Verificar se há pedido de reiniciar (já tratado em função anterior)
+    if (message.toLowerCase() === 'reiniciar' ||
+      message.toLowerCase() === 'começar de novo' ||
+      message.toLowerCase() === 'novo pedido') {
+      return {
+        success: true,
+        text: "Seu pedido foi reiniciado. Como posso ajudar?"
+      };
+    }
+
+    // Calcular duração da conversa
+    const inicio = new Date(conversa.inicio);
+    const agora = new Date();
+    conversa.duracao = Math.round((agora - inicio) / 60000); // Em minutos
 
     // Verificar se a mensagem contém um CEP
     const cepValidation = await detectAndValidateCEP(message);
@@ -2759,378 +2178,89 @@ app.post('/api/message', async (req, res) => {
       // Armazenar o CEP validado na conversa
       conversa.addressData = {
         formattedAddress: cepValidation.formattedAddress,
-        components: cepValidation.components || { cep: cepValidation.formattedAddress.split(', ').pop() } // Garantir que components existe
+        components: cepValidation.components || { cep: cepValidation.formattedAddress.split(', ').pop() }
       };
-
-      // Log explícito após atualização
-      console.log("Conversa atualizada com dados de endereço:", {
-        formattedAddress: conversa.addressData.formattedAddress,
-        components: JSON.stringify(conversa.addressData.components)
-      });
 
       // Salvar imediatamente para garantir persistência
       await conversa.save();
       console.log("Endereço validado e armazenado na conversa");
-      console.log(`[${new Date().toISOString()}] Iniciando carregamento de configurações para ${phone}`);
-    }
-
-    // Calcular duração da conversa
-    const inicio = new Date(conversa.inicio);
-    const agora = new Date();
-    conversa.duracao = Math.round((agora - inicio) / 60000); // Em minutos
-
-    // Verificar se é a primeira mensagem e buscar mensagem de boas-vindas
-    // Na rota /api/message, procure este trecho:
-    if (isFirstMessage) {
-      try {
-        // Adicione uma verificação de mensagens anteriores
-        const mensagensAnteriores = await Conversa.countDocuments({
-          telefone: phone,
-          mensagens: { $elemMatch: { tipo: 'bot' } }
-        });
-
-        // Só enviar boas-vindas se não houver mensagens anteriores
-        if (mensagensAnteriores === 0) {
-          // Buscar configuração de boas-vindas do banco de dados
-          const botConfig = await BotConfig.findOne();
-          const welcomeMessageConfig = botConfig ? botConfig.welcomeMessage : "";
-
-          // Se houver uma mensagem de boas-vindas configurada, enviá-la
-          if (welcomeMessageConfig) {
-            // Registrar no histórico
-            conversa.mensagens.push({
-              tipo: 'bot',
-              conteudo: welcomeMessageConfig,
-              data: new Date().toISOString()
-            });
-
-            await conversa.save();
-
-            return res.json({
-              success: true,
-              text: welcomeMessageConfig,
-              audio: null,
-              image: null
-            });
-          }
-        } else {
-          console.log(`Ignorando mensagem de boas-vindas duplicada para ${phone}`);
-        }
-      } catch (welcomeError) {
-        console.error('Erro ao processar mensagem de boas-vindas:', welcomeError);
-        // Continuar com o fluxo normal se falhar
-      }
-    }
-
-    // Se for tipo de mídia não suportada
-    if (messageType && !['text', 'audio', 'ptt'].includes(messageType)) {
-      try {
-        // Buscar mensagem de erro para mídia não suportada
-        const botConfig = await BotConfig.findOne();
-        const unsupportedMediaMessage = botConfig ? botConfig.unsupportedMediaMessage : "Desculpe, só consigo processar mensagens de texto ou áudio.";
-
-        // Registrar no histórico
-        conversa.mensagens.push({
-          tipo: 'user',
-          conteudo: `[${messageType}]`,
-          data: timestamp || new Date().toISOString()
-        });
-
-        // Detectar pedido completo
-        const userMsg = message.toLowerCase();
-        const hasPizzaType = userMsg.includes('tropicale') ||
-          userMsg.includes('amazonas') ||
-          userMsg.includes('napolitana') ||
-          userMsg.includes('pizza');
-
-        const hasPaymentMethod = userMsg.includes('pix') ||
-          userMsg.includes('débito') ||
-          userMsg.includes('crédito') ||
-          userMsg.includes('dinheiro');
-
-        const hasCEP = /\d{5}-?\d{3}/.test(message);
-        const hasSize = userMsg.includes('pequena') ||
-          userMsg.includes('média') ||
-          userMsg.includes('grande') ||
-          userMsg.includes('gigante');
-
-        // Se parece ser um pedido completo
-        if (hasPizzaType && (hasPaymentMethod || userMsg.includes('pagar')) && hasCEP) {
-          console.log('Pedido completo em uma única mensagem detectado!');
-
-          // Processar o CEP para obter endereço formatado
-          const cepData = await detectAndValidateCEP(message);
-
-          if (cepData) {
-            // Extrair dados do pedido
-            const pizzaName = userMsg.includes('tropicale') ? 'Tropicale' :
-              userMsg.includes('amazonas') ? 'Amazonas' :
-                userMsg.includes('napolitana') ? 'Napolitana Paulistana' : 'Tradicional';
-
-            const pizzaSize = userMsg.includes('pequena') ? 'Pequena' :
-              userMsg.includes('média') ? 'Média' :
-                userMsg.includes('gigante') ? 'Gigante' :
-                  userMsg.includes('grande') ? 'Grande' : 'Grande';
-
-            const paymentMethod = userMsg.includes('pix') ? 'PIX' :
-              userMsg.includes('débito') ? 'Cartão de Débito' :
-                userMsg.includes('crédito') ? 'Cartão de Crédito' : 'Dinheiro';
-
-            // Preços fixos de exemplo
-            const itemPrice = pizzaSize === 'Grande' ? 89.90 :
-              pizzaSize === 'Média' ? 69.90 :
-                pizzaSize === 'Gigante' ? 99.90 : 49.90;
-
-            // Verificar se precisa do número do endereço
-            const numeroMatch = userMsg.match(/número\s+(\d+)/i) ||
-              message.match(/,\s*(\d+)/) ||
-              message.match(/n[º°]\s*(\d+)/i);
-
-            if (!numeroMatch && cepData.components.street) {
-              // Pedir o número do endereço
-              const pedidoNumero = `Ótimo! Anotei seu pedido de Pizza ${pizzaName} ${pizzaSize} para pagar com ${paymentMethod}. Só preciso do número do seu endereço na ${cepData.components.street} para prosseguir com a entrega. Qual é o número?`;
-
-              // Atualizar estado e registrar dados parciais do pedido
-              conversa.state = 4;  // Estado de endereço
-              conversa.addressData = {
-                formattedAddress: cepData.formattedAddress,
-                components: cepData.components
-              };
-
-              // Armazenar dados parciais do pedido para usar depois
-              conversa.pedidoData = {
-                items: [{
-                  nome: `Pizza ${pizzaName} ${pizzaSize}`,
-                  quantidade: 1,
-                  preco: itemPrice
-                }],
-                pagamento: paymentMethod
-              };
-
-              conversa.mensagens.push({
-                tipo: 'bot',
-                conteudo: `[TEXT_FORMAT]${pedidoNumero}[/END]`,
-                data: new Date().toISOString()
-              });
-
-              await conversa.save();
-
-              return res.json({
-                success: true,
-                text: pedidoNumero,
-                state: 4 // Estado de endereço
-              });
-            } else {
-              // Se já tem o número (ou extraiu de alguma forma), mostrar resumo do pedido
-              const numero = numeroMatch ? numeroMatch[1] : '';
-              let enderecoCompleto = cepData.formattedAddress;
-
-              // Adicionar número ao endereço formatado se não estiver presente
-              if (numero && !enderecoCompleto.includes(`, ${numero},`)) {
-                enderecoCompleto = cepData.components.street +
-                  `, ${numero}, ` +
-                  cepData.components.neighborhood +
-                  `, ${cepData.components.city} - ${cepData.components.state}, ` +
-                  cepData.components.cep;
-              }
-
-              // Preparar resumo do pedido
-              const resumoPedido = `
-[TEXT_FORMAT]Vou confirmar seu pedido:
-
-*Pizza ${pizzaName} ${pizzaSize}* - R$ ${itemPrice.toFixed(2)}
-
-*Endereço de entrega:* ${enderecoCompleto}
-*Forma de pagamento:* ${paymentMethod}
-
-*Total:* R$ ${itemPrice.toFixed(2)}
-
-Está tudo correto? Responda SIM para confirmar ou informe se deseja modificar algo.[/END]
-      `.trim();
-
-              // Atualizar estado e dados do pedido
-              conversa.state = 6;  // Estado de confirmação
-              conversa.addressData = {
-                formattedAddress: enderecoCompleto,
-                components: cepData.components
-              };
-
-              conversa.pedidoData = {
-                items: [{
-                  nome: `Pizza ${pizzaName} ${pizzaSize}`,
-                  quantidade: 1,
-                  preco: itemPrice
-                }],
-                endereco: enderecoCompleto,
-                pagamento: paymentMethod
-              };
-
-              conversa.mensagens.push({
-                tipo: 'bot',
-                conteudo: resumoPedido,
-                data: new Date().toISOString()
-              });
-
-              await conversa.save();
-
-              return res.json({
-                success: true,
-                text: resumoPedido.replace('[TEXT_FORMAT]', '').replace('[/END]', '').trim(),
-                state: 6 // Estado de confirmação
-              });
-            }
-          }
-        }
-
-        conversa.mensagens.push({
-          tipo: 'bot',
-          conteudo: unsupportedMediaMessage,
-          data: new Date().toISOString()
-        });
-
-        await conversa.save();
-
-        return res.json({
-          success: true,
-          text: unsupportedMediaMessage,
-          audio: null,
-          image: null
-        });
-      } catch (mediaError) {
-        console.error('Erro ao processar mídia não suportada:', mediaError);
-        return res.status(500).json({
-          success: false,
-          error: 'Erro ao processar mídia',
-          text: 'Desculpe, ocorreu um erro ao processar sua mensagem.'
-        });
-      }
-    }
-
-    // Verificar se é uma pergunta sobre área de entrega
-    const isDeliveryQuery = message.toLowerCase().includes('entrega') &&
-      (message.toLowerCase().includes('?') ||
-        message.toLowerCase().includes('vocês') ||
-        message.toLowerCase().includes('voces'));
-
-    if (isDeliveryQuery) {
-      // Extrair o possível local da consulta
-      const locationMatch = message.match(/(?:em|na|no)\s+([^?.,]+)/i);
-      if (locationMatch && locationMatch[1]) {
-        const location = locationMatch[1].trim();
-        console.log(`Detectou consulta sobre entrega em: ${location}`);
-
-        // Validar como consulta de área, não endereço completo
-        const validationResult = await validateAddress(location, true);
-
-        // Adicionar mensagem do usuário ao histórico
-        conversa.mensagens.push({
-          tipo: 'user',
-          conteudo: isAudio ? `[Áudio]: ${message}` : message,
-          data: timestamp || new Date().toISOString()
-        });
-
-        // Adicionar resposta do bot ao histórico
-        conversa.mensagens.push({
-          tipo: 'bot',
-          conteudo: validationResult.message,
-          data: new Date().toISOString()
-        });
-
-        await conversa.save();
-
-        return res.json({
-          success: true,
-          text: validationResult.message,
-          audio: null,
-          image: null
-        });
-      }
-    }
-
-    // Verificar se a mensagem parece ser um endereço e estamos no estado correto do pedido
-    let isAddressValidationNeeded = false;
-
-    // Se estamos no estado de informar endereço (estado 4 conforme o documento)
-    if (conversa.state === 4) {
-      // Verificar se parece com um endereço (contém nome de rua, avenida, etc.)
-      const parece_endereco = /\b(r\.|rua|av\.|avenida|alameda|al\.|travessa|estrada)\b/i.test(message);
-      isAddressValidationNeeded = parece_endereco;
-    }
-
-    // Se for potencialmente um endereço e estamos no estado correto, validar
-    let validatedAddress = null;
-    if (isAddressValidationNeeded && message && message.length > 10) {
-      try {
-        validatedAddress = await validateAddress(message, false); // false = não é apenas consulta
-
-        // Se o endereço não for válido, retornar feedback imediatamente
-        if (!validatedAddress.valid) {
-          // Adicionar mensagem do usuário ao histórico
-          conversa.mensagens.push({
-            tipo: 'user',
-            conteudo: isAudio ? `[Áudio]: ${message}` : message,
-            data: timestamp || new Date().toISOString()
-          });
-
-          // Adicionar resposta do bot ao histórico
-          conversa.mensagens.push({
-            tipo: 'bot',
-            conteudo: validatedAddress.message,
-            data: new Date().toISOString()
-          });
-
-          await conversa.save();
-
-          // Não avançar o estado se o endereço for inválido
-          return res.json({
-            success: true,
-            text: validatedAddress.message,
-            audio: null,
-            image: null
-          });
-        }
-
-        // Se o endereço for válido, armazenar na conversa
-        if (validatedAddress.valid && validatedAddress.formattedAddress) {
-          conversa.addressData = {
-            formattedAddress: validatedAddress.formattedAddress,
-            components: validatedAddress.components
-          };
-
-          // Adicionar informação do endereço validado à mensagem
-          message = `${message} [Endereço validado: ${validatedAddress.formattedAddress}]`;
-        }
-      } catch (addressError) {
-        console.error('Erro ao validar endereço:', addressError);
-      }
     }
 
     // Adicionar mensagem à conversa
     conversa.mensagens.push({
       tipo: 'user',
       conteudo: isAudio ? `[Áudio]: ${message}` : message,
-      data: timestamp || new Date().toISOString()
+      data: new Date().toISOString()
     });
 
-    // Buscar configurações básicas do bot primeiro
-    let botConfig;
-    try {
-      console.time('get_cached_data');
-      const cachedData = await getCachedData();
-      botConfig = cachedData.botConfig;
-      console.timeEnd('get_cached_data');
-      console.log('Configuração básica do bot carregada do cache');
-    } catch (configError) {
-      console.error('Erro ao carregar configuração do bot:', configError);
-      botConfig = null;
+    // Verificação forçada para estado de endereço (sem número)
+    if (conversa.state === 4) {
+      // Verificar se a mensagem é apenas um número
+      if (message.match(/^\s*\d+\s*$/)) {
+        console.log("Usuário respondeu apenas com um número no estado de endereço");
+
+        // Verificar se temos o nome da rua armazenado
+        if (conversa.addressData && conversa.addressData.components &&
+          conversa.addressData.components.street) {
+
+          let street;
+          if (typeof conversa.addressData.components === 'string') {
+            try {
+              const components = JSON.parse(conversa.addressData.components);
+              street = components.street;
+            } catch (e) {
+              console.error("Erro ao parsear componentes:", e);
+            }
+          } else {
+            street = conversa.addressData.components.street;
+          }
+
+          if (street) {
+            // Formatar endereço completo com o número fornecido
+            const number = message.trim();
+
+            let formattedAddress;
+            if (conversa.addressData.formattedAddress) {
+              formattedAddress = conversa.addressData.formattedAddress.replace(street, `${street}, ${number}`);
+            } else {
+              formattedAddress = `${street}, ${number}`;
+            }
+
+            conversa.addressData.formattedAddress = formattedAddress;
+
+            // Se temos pedidoData, atualizar o endereço lá também
+            if (conversa.pedidoData) {
+              conversa.pedidoData.endereco = formattedAddress;
+            }
+
+            // Avançar para o próximo estado
+            conversa.state = 5;
+
+            await conversa.save();
+
+            // Responder diretamente, sem chamar a API
+            const confirmationMessage = `Perfeito! Endereço registrado: ${formattedAddress}. Qual será a forma de pagamento? Temos as opções: Dinheiro, Cartão de crédito, Cartão de débito, PIX ou VR.`;
+
+            // Adicionar resposta ao histórico
+            conversa.mensagens.push({
+              tipo: 'bot',
+              conteudo: `[TEXT_FORMAT]${confirmationMessage}[/END]`,
+              data: new Date().toISOString()
+            });
+
+            await conversa.save();
+
+            return {
+              success: true,
+              text: `[TEXT_FORMAT]${confirmationMessage}[/END]`,
+              state: 5
+            };
+          }
+        }
+      }
     }
 
-
-    // Verificação forçada para estado de endereço (sem número)
-    // Na função que processa as mensagens, onde verifica o estado
-
     // Verificação para não mencionar troco antes de ter a forma de pagamento
-    // Na parte onde processa a mensagem no estado 5 (pagamento)
     if (conversa.state === 5) {
       // Se for a primeira mensagem neste estado, mostrar opções de pagamento
       if (message !== "5") { // Aqui assumo que o usuário não vai digitar literalmente "5"
@@ -3147,7 +2277,7 @@ Está tudo correto? Responda SIM para confirmar ou informe se deseja modificar a
           const paymentMsg = "Qual será a forma de pagamento? Temos as opções: Dinheiro, Cartão de crédito, Cartão de débito, PIX ou VR.";
 
           // Substituir a chamada ao modelo por uma resposta forçada
-          botResponse = `[TEXT_FORMAT]${paymentMsg}[/END]`;
+          const botResponse = `[TEXT_FORMAT]${paymentMsg}[/END]`;
 
           conversa.mensagens.push({
             tipo: 'bot',
@@ -3157,23 +2287,25 @@ Está tudo correto? Responda SIM para confirmar ou informe se deseja modificar a
 
           await conversa.save();
 
-          return res.json({
+          return {
             success: true,
-            text: paymentMsg
-          });
+            text: botResponse
+          };
         }
         // Se não for a primeira, verificar se precisa especificar tipo de cartão
         else {
           // Verificar se falta especificação de tipo de cartão
+          const temCartao = message.toLowerCase().includes('cartão') ||
+            message.toLowerCase().includes('cartao');
           const temCredito = message.toLowerCase().includes('credito') ||
             message.toLowerCase().includes('crédito');
           const temDebito = message.toLowerCase().includes('debito') ||
             message.toLowerCase().includes('débito');
 
-          // Se não especificou crédito nem débito, pedir clarificação
-          if (!temCredito && !temDebito) {
+          // Se mencionou cartão mas não especificou crédito nem débito, pedir clarificação
+          if (temCartao && !temCredito && !temDebito) {
             // Resposta forçada pedindo para especificar
-            const cartaoMsg = "Por favor, especifique melhor a forma de pagamento. Aceitamos VR, PIX, dinheiro (com a possibilidade de troco) e, se desejar, também consigo finalizar o pedido com cartão de crédito ou débito.";
+            const cartaoMsg = "Por favor, especifique se deseja pagar com cartão de crédito ou débito.";
 
             conversa.mensagens.push({
               tipo: 'bot',
@@ -3184,10 +2316,10 @@ Está tudo correto? Responda SIM para confirmar ou informe se deseja modificar a
             await conversa.save();
 
             // Não avançar o estado até especificar o tipo
-            return res.json({
+            return {
               success: true,
-              text: cartaoMsg
-            });
+              text: `[TEXT_FORMAT]${cartaoMsg}[/END]`
+            };
           }
         }
       }
@@ -3198,19 +2330,14 @@ Está tudo correto? Responda SIM para confirmar ou informe se deseja modificar a
       message.toLowerCase().includes('correto') ||
       message.toLowerCase().includes('ok'))) {
 
-      // Confirmar o pedido definitivamente
-      console.log('Confirmação de pedido detectada');
-      console.log('Estado atual da conversa:', conversa.state);
-      console.log('Conteúdo da mensagem:', message);
-
       // Verificar se temos dados do pedido
       if (!conversa.pedidoData) {
         console.error('Dados do pedido ausentes na confirmação');
-        return res.json({
+        return {
           success: true,
-          text: "Desculpe, houve um problema com seu pedido. Poderia começar novamente?",
+          text: "[TEXT_FORMAT]Desculpe, houve um problema com seu pedido. Poderia começar novamente?[/END]",
           state: 0 // Voltar ao estado inicial
-        });
+        };
       }
 
       try {
@@ -3218,7 +2345,7 @@ Está tudo correto? Responda SIM para confirmar ou informe se deseja modificar a
         const pedidoData = conversa.pedidoData;
         console.log('Dados do pedido encontrados:', JSON.stringify(pedidoData));
 
-        // CORREÇÃO: Garantir que o endereço tenha número
+        // Garantir que o endereço tenha número
         let enderecoCompleto = pedidoData.endereco;
 
         // Se temos dados de endereço com número, usar esse
@@ -3333,46 +2460,23 @@ Seu pedido será entregue em aproximadamente 50 minutos. Obrigado pela preferên
         await novaConversa.save();
         console.log(`Nova conversa criada para futuras interações: ${novaConversa._id}`);
 
-        // ADICIONE ESTE LOG antes de retornar a resposta
-        console.log("ENVIANDO CONFIRMAÇÃO PARA O CLIENTE:", {
-          confirmacaoTexto: confirmacao.substring(0, 100) + "...",
-          formatado: confirmacao.replace('[TEXT_FORMAT]', '').replace('[/END]', '').trim().substring(0, 100) + "..."
-        });
-
         // Verificar se temos o objeto de resposta gerado pelo LLM
         const botResponse = await processTaggedResponse(confirmacao, message, conversa, null);
-        console.log("RESPOSTA PROCESSADA:", {
-          temTexto: !!botResponse.text,
-          textoLength: botResponse.text ? botResponse.text.length : 0,
-          temImagem: !!botResponse.image,
-          temAudio: !!botResponse.audio,
-          state: botResponse.state
-        });
 
-        // Adicione verificações de formatação
-        if (!botResponse.text || botResponse.text.trim().length === 0) {
-          console.warn("ALERTA: Texto de confirmação vazio após processamento!");
-
-          // Garantir que temos texto para enviar
-          botResponse.text = confirmacao.replace('[TEXT_FORMAT]', '').replace('[/END]', '').trim();
-        }
-
-        return res.json(botResponse);
+        return botResponse;
 
       } catch (error) {
         console.error('Erro ao confirmar pedido:', error);
-        return res.json({
+        return {
           success: true,
-          text: "Desculpe, ocorreu um erro ao finalizar seu pedido. Por favor, tente novamente.",
+          text: "[TEXT_FORMAT]Desculpe, ocorreu um erro ao finalizar seu pedido. Por favor, tente novamente.[/END]",
           state: 6 // Manter no estado de confirmação
-        });
+        };
       }
     }
 
-    // AQUI: Verificar se o usuário está pedindo uma imagem específica
+    // Verificar pedido de imagem específica
     const imageRequestIds = detectImageRequest(message);
-
-    // Se detectou pedido de imagem, responder diretamente
     if (imageRequestIds && imageRequestIds.length > 0) {
       console.log(`Pedido de imagem detectado: ${imageRequestIds.join(', ')}`);
 
@@ -3408,22 +2512,29 @@ Seu pedido será entregue em aproximadamente 50 minutos. Obrigado pela preferên
       await conversa.save();
 
       // Processar resposta diretamente
-      const processedResponse = await processTaggedResponse(responseText, message, conversa, botConfig);
+      const processedResponse = await processTaggedResponse(responseText, message, conversa, await BotConfig.findOne());
 
-      console.log('Enviando resposta direta com imagens ao cliente...');
-      console.log(`Total de imagens: ${processedResponse.allImages ? processedResponse.allImages.length : 0}`);
-      return res.json(processedResponse);
+      return processedResponse;
+    }
+
+    // Buscar configurações básicas do bot
+    let botConfig;
+    try {
+      const cachedData = await getCachedData();
+      botConfig = cachedData.botConfig;
+      console.log('Configuração básica do bot carregada do cache');
+    } catch (configError) {
+      console.error('Erro ao carregar configuração do bot:', configError);
+      botConfig = null;
     }
 
     // Buscar configurações completas para construir o contexto do LLM
     let historia, cardapioItems, formasPagamento;
     try {
-      console.time('get_additional_cached_data');
       const cachedData = await getCachedData();
       historia = cachedData.historia;
       formasPagamento = cachedData.formasPagamento;
       cardapioItems = cachedData.cardapioItems;
-      console.timeEnd('get_additional_cached_data');
       console.log('Configurações adicionais carregadas com sucesso');
     } catch (configError) {
       console.error('Erro ao carregar configurações adicionais:', configError);
@@ -3432,8 +2543,8 @@ Seu pedido será entregue em aproximadamente 50 minutos. Obrigado pela preferên
       formasPagamento = [];
     }
 
-    // Histórico de mensagens (até 2 últimas)
-    const ultimas5Mensagens = conversa.mensagens.slice(-10);
+    // Histórico de mensagens (até 10 últimas)
+    const ultimas10Mensagens = conversa.mensagens.slice(-10);
 
     // Preparar mensagens para o modelo
     const mensagens = [
@@ -3444,9 +2555,8 @@ Seu pedido será entregue em aproximadamente 50 minutos. Obrigado pela preferên
       }
     ];
 
-    console.log(`[${new Date().toISOString()}] Prompt processado para ${phone}`);
     // Adicionar histórico de conversa
-    ultimas5Mensagens.forEach(msg => {
+    ultimas10Mensagens.forEach(msg => {
       if (msg.tipo === 'user') {
         mensagens.push({
           role: 'user',
@@ -3460,8 +2570,7 @@ Seu pedido será entregue em aproximadamente 50 minutos. Obrigado pela preferên
       }
     });
 
-    // MODIFICAÇÃO CHAVE: Adicionar lembrete explícito sobre o formato esperado
-    // Pegamos a última mensagem do usuário e adicionamos um lembrete claro
+    // MODIFICAÇÃO: Adicionar lembrete explícito sobre o formato esperado
     if (mensagens.length > 1) {
       // Obter a última mensagem do usuário (a que estamos respondendo agora)
       const lastUserMsgIndex = mensagens.findIndex(m => m.role === 'user');
@@ -3487,21 +2596,15 @@ Seu pedido será entregue em aproximadamente 50 minutos. Obrigado pela preferên
     "pagamento": "Forma de pagamento"
   }
 }
-[/END]
-
-Exemplo de resposta com imagem: 
-[TEXT_FORMAT]Claro! Aqui está a imagem da nossa deliciosa pizza Amazonas.[/END]
-[IMAGE_FORMAT]pizza-salgada_pizza-amazonas[/END]`;
+[/END]`;
       }
     }
 
     let botResponse;
 
     try {
-      console.log(`[${new Date().toISOString()}] Iniciando chamada à API OpenAI para ${phone}`);
+      console.log(`Iniciando chamada à API OpenAI para ${userPhone}`);
       const openaiStartTime = Date.now();
-
-      console.log('Enviando requisição para LLM...');
 
       // Extrair a mensagem de sistema
       const systemMessage = mensagens.find(msg => msg.role === 'system')?.content || '';
@@ -3554,19 +2657,14 @@ Exemplo de resposta com imagem:
         }
 
         const openaiEndTime = Date.now();
-        console.log(`[${new Date().toISOString()}] Resposta do OpenAI recebida para ${phone} em ${openaiEndTime - openaiStartTime}ms`);
+        console.log(`Resposta do OpenAI recebida para ${userPhone} em ${openaiEndTime - openaiStartTime}ms`);
 
-        console.log('Resposta recebida do LLM');
-
-        // Resto do código continua normalmente...
       } catch (openaiError) {
         console.error('Erro na API da OpenAI:', openaiError);
         botResponse = "[TEXT_FORMAT]Desculpe, estou enfrentando alguns problemas técnicos no momento. Poderia tentar novamente em instantes?[/END]";
       }
-      console.log('Resposta recebida do LLM');
 
       // Verificar se a resposta tem JSON de pedido
-      // Quando encontrar JSON_FORMAT, apenas armazene temporariamente, não salve no banco
       if (botResponse.includes('[JSON_FORMAT]')) {
         console.log('Detectado possível pedido na resposta - extraindo JSON');
         try {
@@ -3583,8 +2681,6 @@ Exemplo de resposta com imagem:
               await conversa.save();
 
               console.log('Dados de pedido armazenados temporariamente para', conversa.telefone);
-
-              // NÃO SALVE NO BANCO AQUI! Apenas mostre resumo para confirmação
             }
           }
         } catch (error) {
@@ -3593,9 +2689,9 @@ Exemplo de resposta com imagem:
       }
 
       // Verificar se o LLM está solicitando informações adicionais
-      const needsHistory = botResponse.includes('[REQUEST_HISTORY]') || botResponse.includes('[/REQUEST_HISTORY]') || botResponse.includes('[\REQUEST_HISTORY]');
-      const needsMenu = botResponse.includes('[REQUEST_MENU]') || botResponse.includes('[/REQUEST_MENU]') || botResponse.includes('[\REQUEST_MENU]');
-      const needsPayment = botResponse.includes('[REQUEST_PAYMENT]') || botResponse.includes('[/REQUEST_PAYMENT]') || botResponse.includes('[\REQUEST_PAYMENT]');
+      const needsHistory = botResponse.includes('[REQUEST_HISTORY]') || botResponse.includes('[/REQUEST_HISTORY]');
+      const needsMenu = botResponse.includes('[REQUEST_MENU]') || botResponse.includes('[/REQUEST_MENU]');
+      const needsPayment = botResponse.includes('[REQUEST_PAYMENT]') || botResponse.includes('[/REQUEST_PAYMENT]');
 
       // Se precisar de alguma informação adicional, fazer nova consulta com mais contexto
       if (needsHistory || needsMenu || needsPayment) {
@@ -3603,9 +2699,9 @@ Exemplo de resposta com imagem:
 
         // Remover as tags de solicitação para não confundir o usuário
         botResponse = botResponse
-          .replace('[REQUEST_HISTORY]', '').replace('[/REQUEST_HISTORY]', '').replace('[\REQUEST_HISTORY]', '')
-          .replace('[REQUEST_MENU]', '').replace('[/REQUEST_MENU]', '').replace('[\REQUEST_MENU]', '')
-          .replace('[REQUEST_PAYMENT]', '').replace('[/REQUEST_PAYMENT]', '').replace('[\REQUEST_PAYMENT]', '')
+          .replace('[REQUEST_HISTORY]', '').replace('[/REQUEST_HISTORY]', '')
+          .replace('[REQUEST_MENU]', '').replace('[/REQUEST_MENU]', '')
+          .replace('[REQUEST_PAYMENT]', '').replace('[/REQUEST_PAYMENT]', '')
           .trim();
 
         // Guardar essa resposta para referência
@@ -3645,7 +2741,7 @@ Exemplo de resposta com imagem:
               Lembre-se de formatar sua resposta com [TEXT_FORMAT], [VOICE_FORMAT], [IMAGE_FORMAT] ou [JSON_FORMAT] e terminar com [/END].
             `;
 
-            // Fazer nova consulta à API sem o parâmetro timeout 
+            // Fazer nova consulta à API 
             const enrichedCompletion = await openai.chat.completions.create({
               model: "gpt-4-turbo",
               max_tokens: 1000,
@@ -3657,7 +2753,6 @@ Exemplo de resposta com imagem:
             });
 
             // Substituir a resposta original pela resposta enriquecida
-            // Use a estrutura correta para acessar o conteúdo
             botResponse = enrichedCompletion.choices[0].message.content;
             console.log('Resposta enriquecida obtida com sucesso');
 
@@ -3724,11 +2819,11 @@ Exemplo de resposta com imagem:
 
           await conversa.save();
 
-          return res.json({
+          return {
             success: true,
-            text: addressRequestMsg,
+            text: `[TEXT_FORMAT]${addressRequestMsg}[/END]`,
             state: 4
-          });
+          };
         }
       } else {
         shouldAdvanceState = stateResult;
@@ -3767,18 +2862,131 @@ Exemplo de resposta com imagem:
 
     const apiRequestEndTime = Date.now();
     const totalTime = apiRequestEndTime - apiRequestStartTime;
-    console.log(`[${new Date().toISOString()}] API: Processamento completo para ${phone} em ${totalTime}ms`);
+    console.log(`[${new Date().toISOString()}] Processamento completo para ${userPhone} em ${totalTime}ms`);
     if (totalTime > 5000) {
-      console.warn(`⚠️ Processamento lento detectado (${totalTime}ms) para ${phone}`);
+      console.warn(`⚠️ Processamento lento detectado (${totalTime}ms) para ${userPhone}`);
     }
 
-    // Enviar a resposta
-    console.log('Enviando resposta ao cliente...');
-    return res.json(responseObj);
-
+    // Retornar a resposta
+    return responseObj;
   } catch (error) {
     // Tratamento de erro global
     console.error('ERRO CRÍTICO no processamento da mensagem:', error);
+    return {
+      success: false,
+      error: 'Erro interno do servidor',
+      text: "[TEXT_FORMAT]Desculpe, ocorreu um erro ao processar sua mensagem.[/END]"
+    };
+  }
+}
+
+// ======== ROTAS DA API ==========
+
+// Endpoint de verificação de saúde
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
+// Endpoint para buscar imagem por ID
+app.post('/api/get-image-by-id', async (req, res) => {
+  try {
+    const { imageId } = req.body;
+
+    if (!imageId) {
+      return res.status(400).json({
+        success: false,
+        message: 'ID de imagem não fornecido'
+      });
+    }
+
+    console.log(`Processando solicitação de imagem por ID: ${imageId}`);
+
+    // Buscar a imagem no banco de dados
+    let item = await CardapioItem.findOne({
+      identificador: imageId,
+      disponivel: true
+    });
+
+    // Se não encontrou pelo identificador exato, tenta buscar pelo nome da pizza no ID
+    if (!item && imageId.includes('pizza-')) {
+      const pizzaName = imageId.split('_pizza-')[1] || imageId.split('-pizza-')[1];
+      if (pizzaName) {
+        item = await CardapioItem.findOne({
+          nome: { $regex: new RegExp(pizzaName, 'i') },
+          disponivel: true
+        });
+      }
+    }
+
+    // Se ainda não encontrou, tentar uma busca mais ampla
+    if (!item) {
+      item = await CardapioItem.findOne({
+        $or: [
+          { identificador: { $regex: new RegExp(imageId, 'i') } },
+          { nome: { $regex: new RegExp(imageId, 'i') } }
+        ],
+        disponivel: true
+      });
+    }
+
+    if (!item || !item.imagemGeral) {
+      return res.status(404).json({
+        success: false,
+        message: 'Imagem não encontrada'
+      });
+    }
+
+    // Retornar apenas os dados da imagem (sem processar)
+    res.json({
+      success: true,
+      imageUrl: item.imagemGeral,
+      caption: `*${item.nome}*: ${item.descricao || ''}`
+    });
+  } catch (error) {
+    console.error('Erro ao buscar imagem por ID:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Erro ao buscar imagem'
+    });
+  }
+});
+
+// Endpoint para processamento de mensagem
+app.post('/api/message', async (req, res) => {
+  try {
+    const { phone, message, isAudio, messageType, isFirstMessage, timestamp } = req.body;
+
+    // Validação básica
+    if (!phone) {
+      return res.status(400).json({
+        success: false,
+        error: 'Número de telefone é obrigatório'
+      });
+    }
+
+    if (message === undefined || message === null) {
+      return res.status(400).json({
+        success: false,
+        error: 'Mensagem é obrigatória'
+      });
+    }
+
+    // Buscar ou criar conversa
+    let conversa = await getOrCreateConversation(phone, message);
+    if (!conversa) {
+      return res.status(500).json({
+        success: false,
+        error: 'Erro ao obter conversa'
+      });
+    }
+
+    // Processar mensagem internamente
+    const response = await processMessageInternally(phone, message, isAudio, messageType, conversa);
+
+    // Enviar a resposta
+    return res.json(response);
+  } catch (error) {
+    console.error('ERRO na rota /api/message:', error);
     return res.status(500).json({
       success: false,
       error: 'Erro interno do servidor',
@@ -3787,282 +2995,414 @@ Exemplo de resposta com imagem:
   }
 });
 
-/**
- * Registra o pedido confirmado no banco de dados
- * @param {Object} pedidoData - Dados do pedido em formato JSON
- * @param {Object} conversa - Objeto da conversa
- * @returns {Promise<Object>} - Retorna o objeto do pedido salvo
- */
-async function registrarPedidoConfirmado(pedidoData, conversa) {
-  console.log('Iniciando registro de pedido');
+// Endpoint para validação de endereço
+app.post('/api/validate-address', async (req, res) => {
+  const { address } = req.body;
+
+  if (!address) {
+    return res.status(400).json({
+      success: false,
+      message: 'Endereço não fornecido'
+    });
+  }
 
   try {
-    // Validações básicas dos dados
-    if (!pedidoData) {
-      throw new Error('Dados do pedido ausentes');
-    }
-
-    if (!Array.isArray(pedidoData.items) || pedidoData.items.length === 0) {
-      throw new Error('Itens do pedido inválidos ou vazios');
-    }
-
-    if (!pedidoData.endereco) {
-      throw new Error('Endereço não informado');
-    }
-
-    if (!pedidoData.pagamento) {
-      throw new Error('Forma de pagamento não informada');
-    }
-
-    // Usar o endereço mais completo disponível
-    let enderecoCompleto = pedidoData.endereco;
-
-    // Verificar se o endereço do pedido tem número
-    if (!enderecoCompleto.match(/\d+/)) {
-      // Se não tem número no endereço do pedido, verificar se temos número no userMsg
-      const numeroMatch = userMsg.match(/número\s+(\d+)/i) ||
-        userMsg.match(/,\s*(\d+)/) ||
-        userMsg.match(/n[º°]\s*(\d+)/i);
-
-      if (numeroMatch && conversa.addressData && conversa.addressData.formattedAddress) {
-        // Construir endereço completo com o número
-        const numero = numeroMatch[1];
-        enderecoCompleto = conversa.addressData.components.street +
-          `, ${numero}, ` +
-          conversa.addressData.components.neighborhood +
-          `, ${conversa.addressData.components.city} - ${conversa.addressData.components.state}, ` +
-          conversa.addressData.components.cep;
-      }
-    }
-    if (conversa.addressData && conversa.addressData.formattedAddress) {
-      // Priorizar endereço obtido via CEP
-      enderecoCompleto = conversa.addressData.formattedAddress;
-      console.log('Usando endereço validado via CEP:', enderecoCompleto);
-    }
-
-    // Calcular valor total
-    let valorTotal = 0;
-    pedidoData.items.forEach(item => {
-      const quantidade = item.quantidade || 1;
-      const preco = parseFloat(item.preco);
-      if (isNaN(preco)) {
-        throw new Error(`Preço inválido para o item ${item.nome}`);
-      }
-      valorTotal += preco * quantidade;
-    });
-
-    // Criar novo pedido
-    console.log('Criando novo pedido');
-    const novoPedido = new Pedido({
-      telefone: conversa.telefone,
-      itens: pedidoData.items.map(item => ({
-        nome: item.nome,
-        quantidade: item.quantidade || 1,
-        preco: parseFloat(item.preco)
-      })),
-      valorTotal: valorTotal,
-      endereco: enderecoCompleto,
-      formaPagamento: pedidoData.pagamento,
-      status: 'Confirmado',
-      data: new Date().toISOString()
-    });
-
-    const pedidoSalvo = await novoPedido.save();
-    console.log(`Novo pedido criado com sucesso: ${pedidoSalvo._id}`);
-    return pedidoSalvo;
+    // Validar endereço
+    const result = await validateAddress(address);
+    res.json(result);
   } catch (error) {
-    console.error('Erro no registro de pedido:', error);
+    console.error('Erro ao validar endereço:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Erro ao validar endereço'
+    });
+  }
+});
+
+// Endpoint para gerar áudio
+app.post('/api/generate-audio', async (req, res) => {
+  try {
+    const { text, pedidoId } = req.body;
+
+    if (!text && !pedidoId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Texto ou ID de pedido é obrigatório'
+      });
+    }
+
+    // Determinar qual texto usar para gerar o áudio
+    let audioText = text;
+
+    // Se tiver um ID de pedido, buscar dados do pedido e gerar texto de confirmação
+    if (pedidoId) {
+      try {
+        const pedido = await Pedido.findById(pedidoId);
+        if (pedido) {
+          audioText = gerarTextoConfirmacaoPedido({
+            items: pedido.itens,
+            endereco: pedido.endereco,
+            pagamento: pedido.formaPagamento
+          });
+        }
+      } catch (pedidoError) {
+        console.error('Erro ao buscar pedido:', pedidoError);
+      }
+    }
+
+    if (!audioText) {
+      return res.status(400).json({
+        success: false,
+        error: 'Não foi possível gerar o texto para áudio'
+      });
+    }
+
+    // Limpar o texto para garantir melhor qualidade de áudio
+    const cleanedText = audioText
+      .replace(/<\/?[^>]+(>|$)/g, "") // Remove tags HTML
+      .replace(/\*\*/g, "") // Remove negrito markdown
+      .replace(/\*/g, "") // Remove itálico markdown
+      .substring(0, 4000); // Limitar para evitar erro da API
+
+    // Verificar se temos a API KEY da OpenAI configurada
+    if (!process.env.OPENAI_API_KEY) {
+      console.error('API key da OpenAI não configurada');
+      return res.status(500).json({
+        success: false,
+        error: 'Serviço de áudio não configurado'
+      });
+    }
+
+    // Gerar áudio
+    const audioUrl = await generateAudio(cleanedText);
+    if (!audioUrl) {
+      return res.status(500).json({
+        success: false,
+        error: 'Erro ao gerar áudio'
+      });
+    }
+
+    return res.json({
+      success: true,
+      audio: audioUrl
+    });
+  } catch (error) {
+    console.error('Erro geral ao gerar áudio:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Erro ao gerar áudio',
+      message: error.message
+    });
+  }
+});
+
+// Rotas adicionais da API
+// Categoria
+app.get('/api/categorias', async (req, res) => {
+  try {
+    const categorias = await Categoria.find({ ativo: true }).sort({ ordem: 1 });
+    res.json(categorias);
+  } catch (error) {
+    console.error('Erro ao buscar categorias:', error);
+    res.status(500).json({ success: false, message: 'Erro ao buscar categorias' });
+  }
+});
+
+app.post('/api/categorias', async (req, res) => {
+  try {
+    const { nome } = req.body;
+
+    if (!nome) {
+      return res.status(400).json({ success: false, message: 'Nome da categoria é obrigatório' });
+    }
+
+    // Check if category already exists
+    const existente = await Categoria.findOne({ nome });
+    if (existente) {
+      return res.status(400).json({ success: false, message: 'Esta categoria já existe' });
+    }
+
+    // Get highest order for new category
+    const maxOrdem = await Categoria.findOne().sort({ ordem: -1 });
+    const ordem = maxOrdem ? maxOrdem.ordem + 1 : 1;
+
+    const novaCategoria = await Categoria.create({
+      nome,
+      ordem,
+      ativo: true
+    });
+
+    res.json({ success: true, categoria: novaCategoria });
+  } catch (error) {
+    console.error('Erro ao adicionar categoria:', error);
+    res.status(500).json({ success: false, message: 'Erro ao adicionar categoria' });
+  }
+});
+
+// Configuração do Bot
+app.get('/api/bot-config', async (req, res) => {
+  try {
+    const config = await BotConfig.findOne();
+    res.json(config || {});
+  } catch (error) {
+    console.error('Erro ao buscar configuração do bot:', error);
+    res.status(500).json({ success: false, message: 'Erro ao buscar configuração' });
+  }
+});
+
+app.put('/api/bot-config', async (req, res) => {
+  try {
+    const config = await BotConfig.findOne();
+
+    if (config) {
+      // Atualizar configuração existente
+      const updatedConfig = await BotConfig.findOneAndUpdate({}, req.body, { new: true });
+      res.json(updatedConfig);
+    } else {
+      // Criar nova configuração se não existir
+      const newConfig = await BotConfig.create(req.body);
+      res.json(newConfig);
+    }
+  } catch (error) {
+    console.error('Erro ao atualizar configuração do bot:', error);
+    res.status(500).json({ success: false, message: 'Erro ao atualizar configuração' });
+  }
+});
+
+// Cardápio
+app.get('/api/cardapio', async (req, res) => {
+  try {
+    // Buscar categorias e itens
+    const categorias = await Categoria.find();
+    const items = await CardapioItem.find();
+
+    // Preparar mapeamento de IDs para nomes
+    const idParaNome = {};
+    categorias.forEach(cat => {
+      idParaNome[cat._id.toString()] = cat.nome;
+    });
+
+    // Processar itens para adicionar nome de categoria quando necessário
+    const itemsProcessados = items.map(item => {
+      const obj = item.toObject();
+
+      // Adicionar campo categoriaNome para facilitar filtragem no frontend
+      if (item.categoria) {
+        if (typeof item.categoria === 'string') {
+          if (mongoose.Types.ObjectId.isValid(item.categoria) &&
+            idParaNome[item.categoria]) {
+            obj.categoriaNome = idParaNome[item.categoria];
+          } else {
+            obj.categoriaNome = item.categoria;
+          }
+        } else if (item.categoria.toString && idParaNome[item.categoria.toString()]) {
+          obj.categoriaNome = idParaNome[item.categoria.toString()];
+        }
+      }
+
+      return obj;
+    });
+
+    res.json({
+      categorias: categorias.map(c => c.nome),
+      items: itemsProcessados
+    });
+  } catch (error) {
+    console.error('Erro ao buscar cardápio:', error);
+    res.status(500).json({ success: false, message: 'Erro ao buscar cardápio' });
+  }
+});
+
+// Upload de imagem para Cloudinary
+async function uploadToCloudinary(file, folder = 'pizzaria') {
+  try {
+    // Ler o arquivo do sistema
+    const imageBuffer = fs.readFileSync(file.path);
+
+    // Converter para Base64 (necessário para o upload via API)
+    const base64Image = `data:${file.mimetype};base64,${imageBuffer.toString('base64')}`;
+
+    // Fazer upload para o Cloudinary
+    const result = await cloudinary.uploader.upload(base64Image, {
+      folder: folder,
+      resource_type: 'image'
+    });
+
+    // Remover o arquivo temporário
+    fs.unlinkSync(file.path);
+
+    // Retornar a URL segura da imagem
+    return result.secure_url;
+  } catch (error) {
+    console.error('Erro ao fazer upload para Cloudinary:', error);
     throw error;
   }
 }
 
-// Modificação na função gerarTextoConfirmacaoPedido para usar o endereço mais completo
-// Se possível, manter o restante da função como está
-
-function gerarTextoConfirmacaoPedido(pedidoData) {
+// Pedidos
+app.get('/api/pedidos', async (req, res) => {
   try {
-    if (!pedidoData || !pedidoData.items || !pedidoData.endereco || !pedidoData.pagamento) {
-      return "Pedido confirmado! Obrigado pela preferência.";
-    }
-
-    let texto = "🎉 *PEDIDO CONFIRMADO* 🎉\n\n";
-    texto += "*Itens:*\n";
-
-    let total = 0;
-    pedidoData.items.forEach(item => {
-      const subtotal = parseFloat(item.preco) * (item.quantidade || 1);
-      texto += `- ${item.quantidade || 1}x *${item.nome}*: R$${parseFloat(item.preco).toFixed(2)} = R$${subtotal.toFixed(2)}\n`;
-      total += subtotal;
-    });
-
-    texto += `\n*Valor Total:* R$${total.toFixed(2)}\n`;
-    texto += `*Endereço de Entrega:* ${pedidoData.endereco}\n`;
-    texto += `*Forma de Pagamento:* ${pedidoData.pagamento}\n\n`;
-    texto += "Seu pedido será entregue em aproximadamente 50 minutos. Obrigado pela preferência! 🍕";
-
-    return texto;
+    const pedidos = await Pedido.find().sort({ data: -1 });
+    res.json(pedidos);
   } catch (error) {
-    console.error('Erro ao gerar texto de confirmação:', error);
-    return "Pedido confirmado! Obrigado pela preferência.";
+    console.error('Erro ao buscar pedidos:', error);
+    res.status(500).json({ success: false, message: 'Erro ao buscar pedidos' });
   }
-}
-
-// Função para verificar se deve avançar o estado
-function checkIfShouldAdvanceState(botResponse, userMessage, currentState, conversa) {
-  try {
-    // Lógica básica para determinar se deve avançar de estado
-    const userMsg = userMessage ? userMessage.toLowerCase() : '';
-
-    // Logs para debugging
-    console.log(`Verificando avanço de estado. Estado atual: ${currentState}`);
-    console.log(`Mensagem do usuário: "${userMsg.substring(0, 50)}..."`);
-
-    // Retornar valores concretos em vez de undefined
-    switch (currentState) {
-      case 0: // Escolha de sabor
-        // Verificar sabores específicos ou pedido direto
-        const hasPizzaRequest = userMsg.includes('pizza') ||
-          userMsg.includes('tropicale') ||
-          userMsg.includes('amazonas') ||
-          userMsg.includes('napolitana') ||
-          userMsg.includes('pedido') ||
-          userMsg.includes('quero') ||
-          userMsg.includes('manda');
-
-        console.log(`Estado 0 - Deve avançar? ${hasPizzaRequest} (pedido de pizza detectado)`);
-        return hasPizzaRequest;
-
-      case 1: // Inteira ou meio a meio
-        // Verificar se a mensagem atual ou a mensagem inicial já contém as informações necessárias
-        const shouldAdvance1 = userMsg.includes('inteira') ||
-          userMsg.includes('meio') ||
-          userMsg.includes('metade') ||
-          // Adicionar checagem para ver se já temos sabor e tamanho informados
-          (botResponse.toLowerCase().includes('pizza') &&
-            (botResponse.toLowerCase().includes('grande') ||
-              botResponse.toLowerCase().includes('média') ||
-              botResponse.toLowerCase().includes('pequena') ||
-              botResponse.toLowerCase().includes('familia')));
-
-        // Verificar se o LLM está perguntando sobre tamanho ou tipo
-        const isAskingForSize = botResponse.toLowerCase().includes('tamanho') ||
-          botResponse.toLowerCase().includes('grande') ||
-          botResponse.toLowerCase().includes('média') ||
-          botResponse.toLowerCase().includes('pequena');
-
-        const isAskingForType = botResponse.toLowerCase().includes('inteira') ||
-          botResponse.toLowerCase().includes('meio a meio');
-
-        // Se o LLM já está perguntando sobre tamanho ou tipo, considerar que já temos as informações básicas
-        if (isAskingForSize || isAskingForType) {
-          console.log('LLM já está perguntando sobre tamanho ou tipo, considerando avanço');
-          return true;
-        }
-
-        console.log(`Estado 1 - Deve avançar? ${shouldAdvance1}`);
-        return shouldAdvance1;
-
-      case 2: // Mais pizza ou finalizar
-        const shouldAdvance2 = userMsg.includes('finalizar') ||
-          userMsg.includes('mais uma') ||
-          userMsg.includes('outra pizza');
-        console.log(`Estado 2 - Deve avançar? ${shouldAdvance2}`);
-        return shouldAdvance2;
-
-      case 3: // Bebidas
-        const shouldAdvance3 = userMsg.includes('sim') ||
-          userMsg.includes('não') ||
-          userMsg.includes('nao') ||
-          userMsg.includes('refrigerante') ||
-          userMsg.includes('guaraná') ||
-          userMsg.includes('guarana') ||
-          userMsg.includes('coca') ||
-          userMsg.includes('sem refrigerante') ||
-          userMsg.includes('sem bebida');
-        console.log(`Estado 3 - Deve avançar? ${shouldAdvance3}`);
-        return shouldAdvance3;
-
-      case 4: // Endereço - Exigir número
-        // Verificar se tem CEP
-        const hasCEP = /\d{5}-?\d{3}/.test(userMsg);
-
-        // Verificar se tem número de endereço
-        const hasNumber = /\d+/.test(userMsg);
-
-        console.log(`Estado 4 - Tem CEP? ${hasCEP}, Tem número? ${hasNumber}`);
-
-        // Se tem CEP, mas não detectou número específico, verificar o contexto
-        if (hasCEP) {
-          // Se tiver um número após uma vírgula, considerar como número de endereço
-          const commaNumberMatch = userMsg.match(/,\s*(\d+)/);
-          if (commaNumberMatch) {
-            const addressNumber = commaNumberMatch[1];
-            console.log(`Estado 4 - Número após vírgula detectado: ${addressNumber}`);
-            return true; // Avançar estado
-          }
-        }
-
-        // Verificar se é uma resposta específica para a pergunta sobre número
-        if (userMsg.match(/^\s*\d+\s*$/) && currentState === 4) {
-          console.log(`Estado 4 - Resposta específica com número: ${userMsg.trim()}`);
-          return true; // Se é apenas um número, provavelmente é resposta ao pedido de número
-        }
-
-        if (hasNumber) {
-          return true; // Só avança se tiver número
-        }
-        return false;
-
-      case 5: // Pagamento
-        const shouldAdvance5 = userMsg.includes('débito') ||
-          userMsg.includes('debito') ||
-          userMsg.includes('crédito') ||
-          userMsg.includes('credito') ||
-          userMsg.includes('dinheiro') ||
-          userMsg.includes('pix') ||
-          userMsg.includes('vr');
-        console.log(`Estado 5 - Deve avançar? ${shouldAdvance5}`);
-        return shouldAdvance5;
-
-      case 6: // Confirmação
-        // Se o usuário confirma o pedido
-        const userConfirms = userMessage.toLowerCase().includes('sim') ||
-          userMessage.toLowerCase().includes('confirmo') ||
-          userMessage.toLowerCase().includes('correto') ||
-          userMessage.toLowerCase().includes('ok') ||
-          userMessage.toLowerCase().includes('pode ser');
-
-        // Verificar se o LLM usou a tag de confirmação final
-        const hasConfirmationTag = botResponse.includes('[CONFIRMATION_FORMAT]');
-
-        // Verificar se temos dados de pedido válidos na conversa
-        const hasPedidoData = conversa && conversa.pedidoData &&
-          conversa.pedidoData.items &&
-          conversa.pedidoData.endereco &&
-          conversa.pedidoData.pagamento;
-
-        console.log(`Estado 6 - Usuário confirmou? ${userConfirms}, Tem tag de confirmação? ${hasConfirmationTag}, Tem dados de pedido? ${hasPedidoData}`);
-
-        // Avançar estado apenas se todas as condições forem atendidas
-        const shouldAdvance6 = userConfirms && hasConfirmationTag && hasPedidoData;
-        console.log(`Estado 6 - Deve avançar? ${shouldAdvance6}`);
-        return shouldAdvance6;
-
-      case 7: // Pedido já confirmado - não avançar mais
-        console.log('Estado 7 - Pedido já confirmado, não avançar mais');
-        return false;
-
-      default:
-        console.log(`Estado desconhecido: ${currentState}, não avançar`);
-        return false;
-    }
-  } catch (error) {
-    console.error('Erro na função checkIfShouldAdvanceState:', error);
-    return false; // Em caso de erro, não avançar o estado
-  }
-}
-
-// Iniciar servidor
-app.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
 });
+
+app.get('/api/pedidos/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const pedido = await Pedido.findById(id);
+
+    if (!pedido) {
+      return res.status(404).json({ success: false, message: 'Pedido não encontrado' });
+    }
+
+    res.json(pedido);
+  } catch (error) {
+    console.error('Erro ao buscar pedido:', error);
+    res.status(500).json({ success: false, message: 'Erro ao buscar pedido' });
+  }
+});
+
+// Conversas
+app.get('/api/conversas', async (req, res) => {
+  try {
+    const conversas = await Conversa.find().sort({ inicio: -1 });
+    res.json(conversas);
+  } catch (error) {
+    console.error('Erro ao buscar conversas:', error);
+    res.status(500).json({ success: false, message: 'Erro ao buscar conversas' });
+  }
+});
+
+app.get('/api/conversas/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const conversa = await Conversa.findById(id);
+
+    if (!conversa) {
+      return res.status(404).json({ success: false, message: 'Conversa não encontrada' });
+    }
+
+    res.json(conversa);
+  } catch (error) {
+    console.error('Erro ao buscar conversa:', error);
+    res.status(500).json({ success: false, message: 'Erro ao buscar conversa' });
+  }
+});
+
+// ======== INICIALIZAÇÃO ==========
+
+// Eventos do WhatsApp Bot
+client.on('qr', (qr) => {
+  console.log('[INFO] QR Code gerado. Escaneie com seu WhatsApp:');
+  qrcode.generate(qr, { small: true });
+});
+
+client.on('authenticated', () => {
+  console.log('[SUCESSO] Autenticado com sucesso no WhatsApp!');
+});
+
+client.on('ready', () => {
+  console.log('[BOT PRONTO] O bot está ativo e operando normalmente.');
+
+  // Ativar função de keepAlive caso esteja em produção
+  if (isProduction) {
+    keepAlive();
+  }
+});
+
+// Tentativa de reconexão automática do WhatsApp
+client.on('disconnected', (reason) => {
+  console.log('[ERRO] Cliente WhatsApp desconectado:', reason);
+
+  setTimeout(() => {
+    console.log('[INFO] Tentando reconectar WhatsApp...');
+    client.initialize();
+  }, 10000); // Tentar reconectar após 10 segundos
+});
+
+// Processar mensagens recebidas no WhatsApp
+client.on('message', async (message) => {
+  try {
+    const messageStartTime = Date.now();
+    console.log(`[${new Date().toISOString()}] Mensagem WhatsApp recebida de ${message.from}. ID: ${message.id.id}`);
+
+    // Ignorar mensagens de grupos
+    const chat = await message.getChat();
+    if (chat.isGroup) return;
+
+    // Extrair informações da mensagem
+    const userPhone = message.from;
+
+    // Verificar tipo de mídia
+    if (message.hasMedia) {
+      const media = await message.downloadMedia();
+
+      // Se for áudio ou nota de voz
+      if (message.type === 'audio' || message.type === 'ptt') {
+        await processAudioMessage(userPhone, media);
+        return;
+      }
+
+      // Se for outro tipo de mídia, enviar para a API informando o tipo
+      await processTextMessage(userPhone, `[${message.type}]`);
+      return;
+    }
+
+    // Processar mensagem de texto normal
+    await processTextMessage(userPhone, message.body);
+
+  } catch (error) {
+    console.error('Erro ao processar mensagem WhatsApp:', error);
+    try {
+      await client.sendMessage(message.from, 'Desculpe, ocorreu um erro. Por favor, tente novamente mais tarde.');
+    } catch (e) {
+      console.error('Não foi possível enviar mensagem de erro:', e);
+    }
+  }
+});
+
+// Inicialização do servidor e aplicativos
+async function startServer() {
+  try {
+    // Conectar ao MongoDB
+    await mongoose.connect(process.env.MONGODB_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true
+    });
+    console.log('Conectado ao MongoDB');
+
+    // Inicializar banco de dados com dados padrão
+    await initializeDB();
+
+    // Iniciar o servidor Express
+    app.listen(PORT, () => {
+      console.log(`Servidor Express rodando na porta ${PORT}`);
+
+      // Inicializar o cliente WhatsApp após o servidor estar rodando
+      client.initialize().then(() => {
+        console.log('Cliente WhatsApp inicializado');
+      }).catch(err => {
+        console.error('Erro ao inicializar cliente WhatsApp:', err);
+      });
+    });
+  } catch (error) {
+    console.error('Erro ao iniciar o servidor:', error);
+    process.exit(1);
+  }
+}
+
+// Iniciar o servidor
+startServer();
+
+// Exportar variáveis e funções importantes para uso em outros módulos
+module.exports = {
+  app,
+  client,
+  processMessageInternally,
+  processTaggedResponse,
+  generateAudio
+};
