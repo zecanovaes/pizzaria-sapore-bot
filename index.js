@@ -160,9 +160,6 @@ async function initialize() {
     });
     console.log('✅ Conectado ao MongoDB');
     
-    // Inicializar banco de dados com dados padrão
-    await initializeDB();
-    
     // Inicializar o cliente WhatsApp
     console.log('🔄 Inicializando cliente WhatsApp...');
     client.initialize();
