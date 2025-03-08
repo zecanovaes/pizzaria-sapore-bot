@@ -4062,17 +4062,6 @@ function checkIfShouldAdvanceState(botResponse, userMessage, currentState, conve
   }
 }
 
-// Servir o frontend React em produção
-if (process.env.NODE_ENV === 'production') {
-  // Servir arquivos estáticos do build do React
-  app.use(express.static(path.join(__dirname, '..', 'client', 'build')));
-
-  // Para todas as outras rotas, servir o index.html
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, '..', 'client', 'build', 'index.html'));
-  });
-}
-
 // Iniciar servidor
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
