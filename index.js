@@ -3451,9 +3451,6 @@ client.on('message', async (message) => {
 });
 
 // Inicialização do servidor e aplicativos
-// Adicione esta seção no início do arquivo, na parte de importações
-const ngrok = require('ngrok');
-
 // Adicione esta função para configurar o ngrok
 async function setupNgrok(port) {
   try {
