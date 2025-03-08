@@ -9,6 +9,16 @@ const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 const { exec } = require('child_process'); // Para evitar desligamento em VM
 
+require('dotenv').config({ 
+  path: '/home/ubuntu/pizzaria-project/.env',
+  debug: true  // Adiciona logs de debug
+});
+
+// Logo após, adicione um log para verificar
+console.log('Variáveis de ambiente carregadas:');
+console.log('API_URL:', process.env.API_URL);
+console.log('OPENAI_API_KEY:', process.env.OPENAI_API_KEY ? 'Carregada' : 'Não carregada');
+
 // Configurar ffmpeg
 ffmpeg.setFfmpegPath(ffmpegPath);
 
