@@ -108,22 +108,14 @@ const puppeteerOptions = {
     '--disable-setuid-sandbox',
     '--disable-gpu',
     '--disable-dev-shm-usage',
-    '--disable-accelerated-2d-canvas',
     '--no-first-run',
-    '--no-zygote',
-    '--single-process',
-    '--disable-web-security',
-    '--disable-infobars',
-    '--window-size=1366,768',
-    '--ignore-certificate-errors',
-    '--allow-running-insecure-content',
-    '--disable-extensions'
+    '--single-process'
   ],
-  headless: false,
+  headless: true,
   executablePath: '/usr/bin/google-chrome-stable'
 };
 
-// Inicializar cliente WhatsApp
+// Inicializar cliente WhatsApp com estas opções
 const client = new Client({
   authStrategy: new LocalAuth({ dataPath: AUTH_PATH }),
   puppeteer: puppeteerOptions,
